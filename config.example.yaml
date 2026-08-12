@@ -1,0 +1,27 @@
+# oiiaw config — copy to config.yaml and adjust paths.
+# leave icloud_vault blank to auto-discover on first run.
+
+paths:
+  local_vault: "C:\\Obsidian\\Vault"
+  cloud_vault: ""
+  sync_baseline: "C:\\Obsidian\\Baseline"
+  logs_dir: "C:\\Obsidian\\Logs"
+
+sync:
+  stability_window: 3
+  stabilize_wait: 8
+  cooldown_seconds: 3
+  backoff_seconds: 30
+  backoff_max_seconds: 300
+  big_file_threshold: 102400
+  big_file_cooldown: 30
+  tiny_threshold: 8
+
+logging:
+  console_level: "normal" # quiet | normal | verbose
+  log_retention: 10
+
+ignore:
+  dirs: [".trash", ".fseventsd", ".spotlight-v100", ".apdisk"]
+  files: [".ds_store", "workspace.json", "workspace-mobile.json"]
+  patterns: []  # glob patterns matched against the relative path, e.g. "*.canvas", ".obsidian/plugins/*"
