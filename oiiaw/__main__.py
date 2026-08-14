@@ -51,6 +51,18 @@ def cmd_setup(args):
     run_wizard()
 
 
+def cmd_start(args):
+    """Launches the console-less tray (existing config, no re-mapping
+    folders) without blocking this terminal — unlike `run`, which stays
+    attached. If oiiaw is already running, the launched process's own
+    duplicate-instance check handles that."""
+    from . import autostart
+    if not autostart.start_now():
+        print("oiiaw-tray.exe를 찾을 수 없습니다. pip install이 정상적으로 끝났는지 확인하세요.")
+        sys.exit(1)
+    print("oiiaw를 시작했습니다.")
+
+
 def main_tray():
     """Entry point for the console-less `oiiaw-tray` GUI script — what
     Task Scheduler launches at logon, and what the setup wizard's
@@ -94,7 +106,8 @@ def main():
     parser = argparse.ArgumentParser(prog="oiiaw", description="Obsidian <-> iCloud sync bridge for Windows")
     parser.add_argument("-c", "--config", default=default_config_path(), help="path to config YAML (default: %(default)s)")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("run", help="start the sync daemon").set_defaults(func=cmd_run)
+    sub.add_parser("run", help="start the sync daemon (blocks this terminal)").set_defaults(func=cmd_run)
+    sub.add_parser("start", help="start the tray in the background, using the existing config").set_defaults(func=cmd_start)
     sub.add_parser("status", help="check config and vault file counts").set_defaults(func=cmd_status)
     sub.add_parser("setup", help="run the setup wizard (pick folders, register autostart)").set_defaults(func=cmd_setup)
 
