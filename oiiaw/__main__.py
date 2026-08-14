@@ -15,6 +15,18 @@ def _run(config_path):
     config = Config.load(config_path)
     logger = Logger(config.logs_dir, config.console_level, config.log_retention)
 
+    existing = StatusReporter.read(config.logs_dir)
+    if StatusReporter.is_fresh(existing, max_age=5.0):
+        message = f"oiiaw가 이미 실행 중입니다 (pid {existing['pid']}) — 중복 실행을 막기 위해 새로 시작하지 않습니다."
+        logger.error("START", message, level="important")
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("oiiaw", message)
+        root.destroy()
+        sys.exit(1)
+
     for problem in config.validate():
         if problem.blocking:
             logger.error("CONFIG", problem.message, level="important")
