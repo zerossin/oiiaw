@@ -23,5 +23,9 @@ dev = ["pytest>=8.0.0"]
 [project.scripts]
 oiiaw = "oiiaw.__main__:main"
 
+[project.gui-scripts]
+oiiaw-tray = "oiiaw.__main__:main_tray"
+oiiaw-setup = "oiiaw.setup_wizard:main"
+
 [tool.setuptools.packages.find]
 include = ["oiiaw*"]
