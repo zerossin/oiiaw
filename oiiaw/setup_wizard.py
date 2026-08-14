@@ -29,7 +29,12 @@ def build_config(local_vault: str, cloud_vault: str) -> dict:
             "cloud_vault": cloud_vault,
             "sync_baseline": os.path.join(data_dir, "baseline"),
             "logs_dir": os.path.join(data_dir, "logs"),
-        }
+        },
+        "ignore": {
+            "dirs": [".trash", ".fseventsd", ".spotlight-v100", ".apdisk"],
+            "files": [".ds_store", "workspace.json", "workspace-mobile.json"],
+            "patterns": [],
+        },
     }
 
 
