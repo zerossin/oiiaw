@@ -57,6 +57,21 @@ def atomic_copy(src: str, dst: str):
     os.replace(tmp, dst)
 
 
+def trash_move(vault_root: str, rel_path: str):
+    """Deletion is the one sync outcome nothing else backs up — PUSH/PULL
+    just copy and CONFLICT keeps a backup, so a wrong DELETE judgment would
+    otherwise lose a file with no way back. Moves it into the vault's own
+    `.trash` (already excluded from sync, and where Obsidian users already
+    look for deleted notes) instead of removing it outright."""
+    src = os.path.join(vault_root, rel_path)
+    dst = os.path.join(vault_root, ".trash", rel_path)
+    if os.path.exists(dst):
+        stem, ext = os.path.splitext(dst)
+        dst = f"{stem}_{time.strftime('%Y%m%d_%H%M%S')}{ext}"
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.move(src, dst)
+
+
 @dataclass
 class Backoff:
     base_seconds: float
@@ -298,7 +313,7 @@ class SyncEngine:
 
         if not local_exists and cloud_exists and baseline_exists:
             if sha256_of(cloud) == sha256_of(baseline):
-                os.remove(cloud)
+                trash_move(config.cloud_vault, rel_path)
                 os.remove(baseline)
                 self.log.warn("DELETE", rel_path, level="verbose")
                 return "DELETE"
@@ -310,7 +325,7 @@ class SyncEngine:
 
         if not cloud_exists and local_exists and baseline_exists:
             if sha256_of(local) == sha256_of(baseline):
-                os.remove(local)
+                trash_move(config.local_vault, rel_path)
                 os.remove(baseline)
                 self.log.warn("DELETE", rel_path, level="verbose")
                 return "DELETE"

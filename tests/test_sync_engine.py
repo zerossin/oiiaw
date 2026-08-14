@@ -109,6 +109,29 @@ def test_cooldown_starts_after_successful_push(engine):
     assert engine.cooldown.is_active("note.md") is True
 
 
+def test_delete_moves_to_trash_instead_of_removing(engine):
+    """Deletion is the one sync outcome nothing else backs up — a wrong
+    judgment here has no undo. It should land in the vault's own .trash,
+    not disappear via os.remove()."""
+    local = os.path.join(engine.config.local_vault, "note.md")
+    cloud = os.path.join(engine.config.cloud_vault, "note.md")
+    baseline = os.path.join(engine.config.sync_baseline, "note.md")
+    content = "content long enough to pass the tiny threshold check"
+    for path in (local, cloud, baseline):
+        with open(path, "w") as f:
+            f.write(content)
+    os.remove(local)  # local side genuinely deleted it, matching baseline still on cloud
+
+    asyncio.run(engine.sync_one("note.md"))
+
+    assert not os.path.exists(cloud)
+    assert not os.path.exists(baseline)
+    trashed = os.path.join(engine.config.cloud_vault, ".trash", "note.md")
+    assert os.path.exists(trashed)
+    with open(trashed) as f:
+        assert f.read() == content
+
+
 def test_ignore_patterns_excludes_matching_paths(tmp_path):
     cfg = make_config(tmp_path)
     cfg.ignore_patterns = ["*.canvas"]
