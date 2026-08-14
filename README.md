@@ -17,23 +17,7 @@ oiiaw는 로컬 폴더와 iCloud 폴더를 백그라운드에서 대신 동기�
    ```
    pip install .
    ```
-
-그다음 아래 둘 중 하나로 설정:
-
-**마법사로 설정** (추천)
-```
-oiiaw-setup
-```
-로컬 폴더 / iCloud 폴더 선택 → 설치.
-
-**설정 파일로 직접 설정**
-```
-copy config.example.yaml config.yaml
-```
-`config.yaml`에 경로 채우고:
-```
-oiiaw run -c config.yaml
-```
+4. `oiiaw-setup` 실행 → 로컬 폴더 / iCloud 폴더 선택 → 설치
 
 ## 사용법
 
@@ -43,3 +27,8 @@ oiiaw run -c config.yaml
   상태와 최근 활동 목록이 뜸
 - 터미널에서 `oiiaw status`로도 확인 가능
 - 자동 시작 등록이 실패하면 `oiiaw-setup`을 관리자 권한으로 다시 실행
+
+## 고급: 설정 파일 직접 편집
+
+마법사 대신 `config.example.yaml`을 `config.yaml`로 복사해 경로를 채우고
+`oiiaw run -c config.yaml`로 실행할 수도 있습니다.
