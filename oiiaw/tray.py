@@ -15,6 +15,7 @@ import tkinter as tk
 from PIL import Image, ImageDraw
 import pystray
 
+from . import autostart
 from .status_file import StatusReporter
 
 _COLORS = {
@@ -134,6 +135,7 @@ class TrayApp:
         self.log = logger
         self.engine = engine
         self._stop = threading.Event()
+        self._restart_requested = False
         self._status_window = StatusWindow(config)
         self._icon = pystray.Icon(
             "oiiaw",
@@ -142,6 +144,7 @@ class TrayApp:
             menu=pystray.Menu(
                 pystray.MenuItem("상태 보기", self._show_status, default=True),
                 pystray.MenuItem("로그 폴더 열기", self._open_logs),
+                pystray.MenuItem("재시작", self._restart),
                 pystray.MenuItem("종료", self._quit),
             ),
         )
@@ -185,6 +188,21 @@ class TrayApp:
         self._status_window.stop()
         icon.stop()
 
+    def _restart(self, icon, item):
+        self._restart_requested = True
+        self._quit(icon, item)
+
+    def _relaunch(self):
+        # Wipe the heartbeat file first — the new process's own duplicate-
+        # instance check would otherwise see this one's last (still-fresh)
+        # heartbeat and refuse to start, mistaking a clean handoff for two
+        # instances racing.
+        try:
+            os.remove(os.path.join(self.config.logs_dir, "status.json"))
+        except OSError:
+            pass
+        autostart.start_now()
+
     def run(self):
         engine_thread = threading.Thread(target=lambda: asyncio.run(self.engine.run()), daemon=True)
         engine_thread.start()
@@ -197,3 +215,5 @@ class TrayApp:
         self._status_window.stop()
         engine_thread.join(timeout=5)
         window_thread.join(timeout=5)
+        if self._restart_requested:
+            self._relaunch()
