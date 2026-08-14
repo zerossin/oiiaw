@@ -10,6 +10,9 @@ doing" reads that file instead of reaching into the daemon directly.
 import os
 import json
 import time
+from collections import deque
+
+HISTORY_LIMIT = 50
 
 
 class StatusReporter:
@@ -20,9 +23,11 @@ class StatusReporter:
         self.conflict_count = 0
         self.error_count = 0
         self.last_event: dict | None = None
+        self._history: deque = deque(maxlen=HISTORY_LIMIT)
 
     def record_event(self, event_type: str, rel_path: str):
         self.last_event = {"type": event_type, "path": rel_path, "time": time.time()}
+        self._history.append(self.last_event)
         if event_type == "CONFLICT":
             self.conflict_count += 1
         elif event_type == "ERROR":
@@ -38,6 +43,7 @@ class StatusReporter:
             "state": state,
             "pending": pending,
             "last_event": self.last_event,
+            "history": list(self._history),
             "conflict_count": self.conflict_count,
             "error_count": self.error_count,
         }
