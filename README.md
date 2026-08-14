@@ -8,8 +8,12 @@ oiiaw는 로컬 폴더와 iCloud 폴더를 백그라운드에서 대신 동기�
 ## 설치
 
 1. [Python 3.11+](https://www.python.org/downloads/) 설치 — **"Add python.exe to PATH"** 체크
-2. 이 페이지 위쪽 **Code → Download ZIP** → 압축 풀기
-3. 압축 푼 폴더에서 `cmd` 열고:
+2. 코드 받기:
+   ```
+   git clone https://github.com/zerossin/oiiaw.git
+   ```
+   git이 없다면 이 페이지 위쪽 **Code → Download ZIP** → 압축 풀기
+3. 받은 폴더에서 `cmd` 열고:
    ```
    pip install .
    ```
