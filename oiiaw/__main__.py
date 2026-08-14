@@ -1,11 +1,13 @@
 import argparse
-import asyncio
 import os
 import sys
+import time
 
 from .config import Config
 from .logger import Logger
 from .sync_engine import SyncEngine
+from .status_file import StatusReporter
+from .tray import TrayApp
 
 
 def cmd_run(args):
@@ -24,7 +26,7 @@ def cmd_run(args):
 
     logger.info("START", f"local={config.local_vault} cloud={config.cloud_vault}", level="important")
     engine = SyncEngine(config, logger)
-    asyncio.run(engine.run())
+    TrayApp(config, logger, engine).run()
 
 
 def cmd_status(args):
@@ -35,6 +37,17 @@ def cmd_status(args):
     for problem in problems:
         tag = "blocking" if problem.blocking else "warning"
         print(f"config [{tag}]: {problem.message}")
+
+    status = StatusReporter.read(config.logs_dir)
+    if StatusReporter.is_fresh(status):
+        uptime = int(time.time() - status["started_at"])
+        print(f"daemon: running (pid {status['pid']}, uptime {uptime}s, state={status['state']}, pending={status['pending']})")
+        last = status.get("last_event")
+        if last:
+            print(f"  last event: {last['type']} {last['path']} ({int(time.time() - last['time'])}s ago)")
+        print(f"  this session: {status['conflict_count']} conflicts, {status['error_count']} errors")
+    else:
+        print("daemon: not running (or not responding)")
 
     for name, path in (("local_vault", config.local_vault), ("cloud_vault", config.cloud_vault), ("sync_baseline", config.sync_baseline)):
         count = sum(len(files) for _, _, files in os.walk(path)) if path and os.path.isdir(path) else 0

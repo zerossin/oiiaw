@@ -36,6 +36,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from .cloud_status import CloudFilter
+from .status_file import StatusReporter
 
 
 def sha256_of(path: str) -> str | None:
@@ -140,6 +141,9 @@ class SyncEngine:
         self.pending: asyncio.Queue[str] = asyncio.Queue()
         self.queued: set[str] = set()
         self.loop: asyncio.AbstractEventLoop | None = None
+        self.status = StatusReporter(getattr(config, "logs_dir", None))
+        self.active = 0
+        self._shutdown_event = asyncio.Event()
 
     # ── path helpers ──
 
@@ -198,14 +202,26 @@ class SyncEngine:
         observer.start()
         return observer
 
+    def request_shutdown(self):
+        """Thread-safe: the tray icon calls this from a different thread
+        than the one running this engine's asyncio loop."""
+        if self.loop:
+            self.loop.call_soon_threadsafe(self._shutdown_event.set)
+
     async def _worker(self):
         while True:
             rel_path = await self.pending.get()
             self.queued.discard(rel_path)
+            self.active += 1
             try:
-                await self.sync_one(rel_path)
+                event = await self.sync_one(rel_path)
+                if event:
+                    self.status.record_event(event, rel_path)
             except Exception as e:
                 self.log.error("ERROR", f"{rel_path}: {e}")
+                self.status.record_event("ERROR", rel_path)
+            finally:
+                self.active -= 1
 
     # ── three-way sync decision ──
 
@@ -264,7 +280,7 @@ class SyncEngine:
             atomic_copy(local, baseline)
             self._start_cooldown(rel_path, local)
             self.log.success("PUSH", rel_path, level="verbose")
-            return
+            return "PUSH"
 
         if cloud_exists and not local_exists and not baseline_exists:
             if os.path.getsize(cloud) < config.tiny_threshold:
@@ -278,31 +294,31 @@ class SyncEngine:
             atomic_copy(cloud, baseline)
             self._start_cooldown(rel_path, cloud)
             self.log.success("PULL", rel_path, level="verbose")
-            return
+            return "PULL"
 
         if not local_exists and cloud_exists and baseline_exists:
             if sha256_of(cloud) == sha256_of(baseline):
                 os.remove(cloud)
                 os.remove(baseline)
                 self.log.warn("DELETE", rel_path, level="verbose")
-            else:
-                atomic_copy(cloud, local)
-                atomic_copy(cloud, baseline)
-                self._start_cooldown(rel_path, cloud)
-                self.log.success("PULL", rel_path, level="verbose")
-            return
+                return "DELETE"
+            atomic_copy(cloud, local)
+            atomic_copy(cloud, baseline)
+            self._start_cooldown(rel_path, cloud)
+            self.log.success("PULL", rel_path, level="verbose")
+            return "PULL"
 
         if not cloud_exists and local_exists and baseline_exists:
             if sha256_of(local) == sha256_of(baseline):
                 os.remove(local)
                 os.remove(baseline)
                 self.log.warn("DELETE", rel_path, level="verbose")
-            else:
-                atomic_copy(local, cloud)
-                atomic_copy(local, baseline)
-                self._start_cooldown(rel_path, local)
-                self.log.success("PUSH", rel_path, level="verbose")
-            return
+                return "DELETE"
+            atomic_copy(local, cloud)
+            atomic_copy(local, baseline)
+            self._start_cooldown(rel_path, local)
+            self.log.success("PUSH", rel_path, level="verbose")
+            return "PUSH"
 
         if local_exists and cloud_exists and not baseline_exists:
             # both sides already exist with no baseline yet (fresh vault, or
@@ -320,11 +336,13 @@ class SyncEngine:
             atomic_copy(local, baseline)
             self._start_cooldown(rel_path, local)
             self.log.success("PUSH", rel_path, level="verbose")
+            return "PUSH"
         elif cloud_hash != baseline_hash and local_hash == baseline_hash:
             atomic_copy(cloud, local)
             atomic_copy(cloud, baseline)
             self._start_cooldown(rel_path, cloud)
             self.log.success("PULL", rel_path, level="verbose")
+            return "PULL"
         else:
             # both sides changed — wait longer in case one is still mid-edit,
             # then decide with fresh hashes instead of the ones we started with.
@@ -334,7 +352,7 @@ class SyncEngine:
                 atomic_copy(local, baseline)
                 self._start_cooldown(rel_path, local)
                 self.log.info("RESOLVED", f"{rel_path} — settled to the same content while waiting", level="verbose")
-                return
+                return "RESOLVED"
             winner, loser = (local, cloud) if os.path.getmtime(local) >= os.path.getmtime(cloud) else (cloud, local)
             backup = f"{loser}_CONFLICT_{time.strftime('%Y%m%d_%H%M%S')}"
             shutil.copy2(loser, backup)
@@ -343,6 +361,7 @@ class SyncEngine:
             atomic_copy(winner, baseline)
             self._start_cooldown(rel_path, winner)
             self.log.warn("CONFLICT", f"{rel_path} — kept newer, backed up loser", level="important")
+            return "CONFLICT"
 
     # ── main entry ──
 
@@ -354,9 +373,14 @@ class SyncEngine:
         try:
             for rel in self.discover_tracked_paths():
                 self.enqueue(rel)
-            while True:
-                await asyncio.sleep(5)
+            while not self._shutdown_event.is_set():
+                state = "syncing" if self.active > 0 or not self.pending.empty() else "idle"
+                self.status.write(state, self.pending.qsize())
                 self.log.flush()
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    pass
         finally:
             for w in workers:
                 w.cancel()
