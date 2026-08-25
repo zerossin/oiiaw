@@ -12,11 +12,11 @@ import asyncio
 import threading
 import tkinter as tk
 
-from PIL import Image, ImageDraw
 import pystray
 
 from . import autostart
 from .status_file import StatusReporter
+from .ui_assets import apply_window_icon, configure_windows_app_identity, tray_icon
 
 _COLORS = {
     "idle": (70, 130, 180),
@@ -26,13 +26,6 @@ _COLORS = {
 }
 
 _REFRESH_SECONDS = 2
-
-
-def _dot(color) -> Image.Image:
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    ImageDraw.Draw(img).ellipse((4, 4, size - 4, size - 4), fill=color)
-    return img
 
 
 class StatusWindow:
@@ -56,12 +49,15 @@ class StatusWindow:
         self._show_event.set()
 
     def stop(self):
+        # Tk belongs to the window thread. Calling root.after() from a
+        # pystray callback can race with mainloop teardown, and restart calls
+        # stop twice by design. Let the existing poll destroy its own root.
         self._stop_event.set()
-        if self.root:
-            self.root.after(0, self.root.destroy)
 
     def run(self):
+        configure_windows_app_identity()
         self.root = tk.Tk()
+        apply_window_icon(self.root)
         self.root.title("oiiaw 상태")
         self.root.geometry("420x420")
         self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
@@ -87,6 +83,7 @@ class StatusWindow:
         self.root.withdraw()
         self._poll()
         self.root.mainloop()
+        self.root = None
 
     def _open_logs(self):
         os.makedirs(self.config.logs_dir, exist_ok=True)
@@ -94,6 +91,7 @@ class StatusWindow:
 
     def _poll(self):
         if self._stop_event.is_set():
+            self.root.destroy()
             return
         if self._show_event.is_set():
             self._show_event.clear()
@@ -139,7 +137,7 @@ class TrayApp:
         self._status_window = StatusWindow(config)
         self._icon = pystray.Icon(
             "oiiaw",
-            _dot(_COLORS["idle"]),
+            tray_icon(_COLORS["idle"]),
             "oiiaw",
             menu=pystray.Menu(
                 pystray.MenuItem("상태 보기", self._show_status, default=True),
@@ -171,7 +169,7 @@ class TrayApp:
     def _refresh_loop(self):
         while not self._stop.is_set():
             status = StatusReporter.read(self.config.logs_dir)
-            self._icon.icon = _dot(_COLORS[self._icon_state(status)])
+            self._icon.icon = tray_icon(_COLORS[self._icon_state(status)])
             self._icon.title = self._tooltip(status)
             time.sleep(_REFRESH_SECONDS)
 

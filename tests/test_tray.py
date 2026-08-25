@@ -10,7 +10,7 @@ import os
 import json
 import types
 
-from oiiaw.tray import TrayApp
+from oiiaw.tray import StatusWindow, TrayApp
 
 
 def test_relaunch_clears_stale_heartbeat_before_starting_new_process(tmp_path, monkeypatch):
@@ -29,3 +29,17 @@ def test_relaunch_clears_stale_heartbeat_before_starting_new_process(tmp_path, m
 
     assert not os.path.exists(status_path)
     assert started == [True]
+
+
+def test_status_window_stop_is_thread_safe_and_idempotent():
+    window = StatusWindow(config=None)
+
+    class ForeignThreadRoot:
+        def after(self, *args):
+            raise AssertionError("Tk must only be called from its owning thread")
+
+    window.root = ForeignThreadRoot()
+    window.stop()
+    window.stop()
+
+    assert window._stop_event.is_set()

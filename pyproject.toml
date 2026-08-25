@@ -29,3 +29,6 @@ oiiaw-setup = "oiiaw.setup_wizard:main"
 
 [tool.setuptools.packages.find]
 include = ["oiiaw*"]
+
+[tool.setuptools.package-data]
+oiiaw = ["assets/*.png", "assets/*.ico"]

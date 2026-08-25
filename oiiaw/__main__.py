@@ -9,9 +9,11 @@ from .sync_engine import SyncEngine
 from .status_file import StatusReporter
 from .tray import TrayApp
 from .paths import default_config_path
+from .ui_assets import apply_window_icon, configure_windows_app_identity
 
 
 def _run(config_path):
+    configure_windows_app_identity()
     config = Config.load(config_path)
     logger = Logger(config.logs_dir, config.console_level, config.log_retention)
 
@@ -22,6 +24,7 @@ def _run(config_path):
         import tkinter as tk
         from tkinter import messagebox
         root = tk.Tk()
+        apply_window_icon(root)
         root.withdraw()
         messagebox.showerror("oiiaw", message)
         root.destroy()

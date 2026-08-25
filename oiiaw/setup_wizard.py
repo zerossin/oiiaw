@@ -14,6 +14,7 @@ import yaml
 
 from .config import discover_icloud_vault
 from .paths import app_data_dir, default_config_path
+from .ui_assets import apply_window_icon, configure_windows_app_identity
 from . import autostart
 
 
@@ -48,7 +49,9 @@ def write_config(data: dict, path: str = None) -> str:
 
 class SetupWizard(tk.Tk):
     def __init__(self):
+        configure_windows_app_identity()
         super().__init__()
+        apply_window_icon(self)
         self.title("oiiaw 설치")
         self.resizable(False, False)
 
