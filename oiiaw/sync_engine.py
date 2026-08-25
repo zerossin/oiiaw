@@ -4,15 +4,15 @@ as the last-known-good reference used to tell "which side actually changed"
 apart from "these two just differ".
 
 Concurrency model: a fixed pool of worker coroutines pulls relative paths
-off one shared queue. A `pending` set dedupes — if a path is already queued
-or being worked on, a repeat filesystem event is dropped instead of queued
-again. This keeps memory bounded by `worker_count`, not by how many distinct
-files have ever changed since startup (no per-file task/queue to grow
-without limit, no idle-cleanup timers needed).
+off one shared queue. `queued` dedupes waiting work; `in_flight` plus `dirty`
+serializes each path and coalesces events received while it is active. This
+keeps memory bounded by the number of paths currently needing work, with no
+per-file worker or idle-cleanup task.
 
 Anything that can't be acted on right now (cloud content not hydrated yet,
-content too small to trust) gets an increasing backoff, not a fixed
-every-N-seconds retry forever.
+a file still being written, or an active cooldown) gets a scheduled retry.
+Filesystem events that arrive while the same path is being processed are
+coalesced into one follow-up pass instead of being dropped or run concurrently.
 
 New files wait `stability_window` seconds and get re-checked for size
 changes before being pushed/pulled, so a file mid-autosave doesn't get
@@ -80,7 +80,10 @@ class Backoff:
     _streak: dict = field(default_factory=dict)
 
     def is_active(self, key: str) -> bool:
-        return self._until.get(key, 0) > time.time()
+        return self.remaining(key) > 0
+
+    def remaining(self, key: str) -> float:
+        return max(0.0, self._until.get(key, 0) - time.time())
 
     def bump(self, key: str) -> float:
         n = self._streak.get(key, 0) + 1
@@ -96,11 +99,10 @@ class Backoff:
 
 @dataclass
 class Cooldown:
-    """After a successful push/pull, ignore repeat events for this path for
-    a bit — otherwise autosave-on-every-keystroke apps re-trigger a sync
-    cycle for the same file dozens of times a minute. Big files get a longer
-    cooldown since they take longer to actually finish copying/uploading on
-    the other side."""
+    """After a successful push/pull, defer repeat events for this path for a
+    bit — otherwise autosave-on-every-keystroke apps re-trigger a sync cycle
+    dozens of times a minute. Big files get a longer cooldown since they take
+    longer to actually finish copying/uploading on the other side."""
 
     normal_seconds: float
     big_file_seconds: float
@@ -108,7 +110,10 @@ class Cooldown:
     _until: dict = field(default_factory=dict)
 
     def is_active(self, key: str) -> bool:
-        return self._until.get(key, 0) > time.time()
+        return self.remaining(key) > 0
+
+    def remaining(self, key: str) -> float:
+        return max(0.0, self._until.get(key, 0) - time.time())
 
     def start(self, key: str, file_size: int):
         duration = self.big_file_seconds if file_size >= self.big_file_threshold else self.normal_seconds
@@ -155,6 +160,9 @@ class SyncEngine:
         self.worker_count = worker_count
         self.pending: asyncio.Queue[str] = asyncio.Queue()
         self.queued: set[str] = set()
+        self.in_flight: set[str] = set()
+        self.dirty: set[str] = set()
+        self._retry_handles: dict[str, asyncio.TimerHandle] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.status = StatusReporter(getattr(config, "logs_dir", None))
         self.active = 0
@@ -164,7 +172,7 @@ class SyncEngine:
 
     def is_tracked(self, rel_path: str) -> bool:
         name = os.path.basename(rel_path).lower()
-        if name in self.config.ignored_files or name.endswith(".tmp"):
+        if name in self.config.ignored_files or name.endswith((".tmp", ".oiiaw-tmp")):
             return False
         parts = [p.lower() for p in rel_path.split(os.sep)]
         if any(p in self.config.ignored_dirs for p in parts):
@@ -198,10 +206,38 @@ class SyncEngine:
     # ── queue plumbing ──
 
     def enqueue(self, rel_path: str):
+        if rel_path in self.in_flight:
+            self.dirty.add(rel_path)
+            return
         if rel_path in self.queued:
             return
         self.queued.add(rel_path)
         self.pending.put_nowait(rel_path)
+
+    def _schedule_retry(self, rel_path: str, delay: float):
+        """Coalesces delayed retries without losing the earliest wake-up.
+
+        A retry re-enters the normal queue, so the same per-path serialization
+        rules apply to timer wake-ups and filesystem events alike.
+        """
+        loop = self.loop or asyncio.get_running_loop()
+        target = loop.time() + max(0.01, delay)
+        current = self._retry_handles.get(rel_path)
+        if current and not current.cancelled():
+            if current.when() <= target:
+                return
+            current.cancel()
+
+        def wake():
+            self._retry_handles.pop(rel_path, None)
+            self.enqueue(rel_path)
+
+        self._retry_handles[rel_path] = loop.call_at(target, wake)
+
+    def _cancel_retry(self, rel_path: str):
+        handle = self._retry_handles.pop(rel_path, None)
+        if handle:
+            handle.cancel()
 
     def _on_fs_event(self, abs_path: str, root: str):
         rel = self._relativize(abs_path, root)
@@ -227,6 +263,7 @@ class SyncEngine:
         while True:
             rel_path = await self.pending.get()
             self.queued.discard(rel_path)
+            self.in_flight.add(rel_path)
             self.active += 1
             try:
                 event = await self.sync_one(rel_path)
@@ -237,6 +274,11 @@ class SyncEngine:
                 self.status.record_event("ERROR", rel_path)
             finally:
                 self.active -= 1
+                self.in_flight.discard(rel_path)
+                self.pending.task_done()
+                if rel_path in self.dirty:
+                    self.dirty.discard(rel_path)
+                    self.enqueue(rel_path)
 
     # ── three-way sync decision ──
 
@@ -264,8 +306,11 @@ class SyncEngine:
 
     async def sync_one(self, rel_path: str):
         config = self.config
-        if self.backoff.is_active(rel_path) or self.cooldown.is_active(rel_path):
+        blocked_for = max(self.backoff.remaining(rel_path), self.cooldown.remaining(rel_path))
+        if blocked_for > 0:
+            self._schedule_retry(rel_path, blocked_for)
             return
+        self._cancel_retry(rel_path)
 
         local = os.path.join(config.local_vault, rel_path)
         cloud = os.path.join(config.cloud_vault, rel_path)
@@ -274,6 +319,7 @@ class SyncEngine:
 
         if cloud_exists and not self.cloud.is_content_available(cloud):
             delay = self.backoff.bump(rel_path)
+            self._schedule_retry(rel_path, delay)
             self.log.info("WAIT", f"{rel_path} — cloud content not fully on disk yet, retry in {delay:.0f}s", level="verbose")
             return
         self.backoff.reset(rel_path)
@@ -284,11 +330,8 @@ class SyncEngine:
             return
 
         if local_exists and not cloud_exists and not baseline_exists:
-            if os.path.getsize(local) < config.tiny_threshold:
-                delay = self.backoff.bump(rel_path)
-                self.log.info("SKIP", f"{rel_path} too small — retry in {delay:.0f}s", level="verbose")
-                return
             if not await self._settled(local, config.stability_window):
+                self._schedule_retry(rel_path, config.stability_window)
                 self.log.info("WAIT", f"{rel_path} not settled yet, deferring", level="verbose")
                 return
             atomic_copy(local, cloud)
@@ -298,11 +341,8 @@ class SyncEngine:
             return "PUSH"
 
         if cloud_exists and not local_exists and not baseline_exists:
-            if os.path.getsize(cloud) < config.tiny_threshold:
-                delay = self.backoff.bump(rel_path)
-                self.log.info("SKIP", f"{rel_path} too small — retry in {delay:.0f}s", level="verbose")
-                return
             if not await self._settled(cloud, config.stability_window):
+                self._schedule_retry(rel_path, config.stability_window)
                 self.log.info("WAIT", f"{rel_path} not settled yet, deferring", level="verbose")
                 return
             atomic_copy(cloud, local)
@@ -399,5 +439,8 @@ class SyncEngine:
         finally:
             for w in workers:
                 w.cancel()
+            for handle in self._retry_handles.values():
+                handle.cancel()
+            self._retry_handles.clear()
             observer.stop()
             observer.join()

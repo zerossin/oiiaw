@@ -15,7 +15,6 @@ sync:
   backoff_max_seconds: 300
   big_file_threshold: 102400
   big_file_cooldown: 30
-  tiny_threshold: 8
 
 logging:
   console_level: "normal" # quiet | normal | verbose

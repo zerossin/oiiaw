@@ -33,8 +33,6 @@ class Config:
         self.backoff_max_seconds = sync.get("backoff_max_seconds", 300)
         self.big_file_threshold = sync.get("big_file_threshold", 102400)
         self.big_file_cooldown = sync.get("big_file_cooldown", 30)
-        self.tiny_threshold = sync.get("tiny_threshold", 8)
-
         logging_cfg = data.get("logging", {})
         self.console_level = logging_cfg.get("console_level", "normal")
         self.log_retention = logging_cfg.get("log_retention", 10)
