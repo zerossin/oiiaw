@@ -124,6 +124,9 @@ class SetupWizard(tk.Tk):
         if self.autostart_var.get():
             _, detail = autostart.register()
             message += "\n" + detail
+        else:
+            _, detail = autostart.unregister()
+            message += "\n" + detail
 
         if messagebox.askyesno("oiiaw", message + "\n\n지금 바로 동기화를 시작할까요?"):
             autostart.start_now()
