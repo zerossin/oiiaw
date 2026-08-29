@@ -5,19 +5,37 @@ Obsidian ↔ iCloud, Windows용 자동 동기화 도구.
 Obsidian을 iCloud Drive 폴더에서 직접 열면 저장할 때마다 충돌 파일이 생깁니다.
 oiiaw는 로컬 폴더와 iCloud 폴더를 백그라운드에서 대신 동기화해서 이 문제를 없애줍니다.
 
+> [!WARNING]
+> 현재 Windows용 베타 버전입니다. 처음 사용하기 전에 로컬 및 iCloud 문서를 백업하세요.
+
 ## 설치
 
 1. [Python 3.11+](https://www.python.org/downloads/) 설치 — **"Add python.exe to PATH"** 체크
-2. 코드 받기:
+2. 터미널(`PowerShell` 또는 `cmd`)에서 설치:
+   ```powershell
+   py -m pip install oiiaw
    ```
-   git clone https://github.com/zerossin/oiiaw.git
+3. 설치 마법사 실행:
+   ```powershell
+   oiiaw-setup
    ```
-   git이 없다면 이 페이지 위쪽 **Code → Download ZIP** → 압축 풀기
-3. 받은 폴더에서 `cmd` 열고:
-   ```
-   pip install .
-   ```
-4. `oiiaw-setup` 실행 → 로컬 폴더 / iCloud 폴더 선택 → 설치
+4. 로컬 폴더와 iCloud 폴더를 선택해 설정 완료
+
+업데이트할 때는 다음 명령을 실행하세요.
+
+```powershell
+py -m pip install --upgrade oiiaw
+```
+
+### 소스에서 설치
+
+최신 개발 버전을 직접 설치하려면:
+
+```powershell
+git clone https://github.com/zerossin/oiiaw.git
+cd oiiaw
+py -m pip install .
+```
 
 ## 사용법
 
