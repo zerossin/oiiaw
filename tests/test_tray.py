@@ -114,3 +114,29 @@ def test_conflict_event_resolves_local_current_and_backup_paths(tmp_path):
 
     assert current == os.path.join(str(tmp_path), "notes/note.md")
     assert conflict == os.path.join(str(tmp_path), "notes/note_CONFLICT_1.md")
+
+
+def test_update_handoff_stops_tray_without_normal_relaunch(tmp_path, monkeypatch):
+    calls = []
+
+    class Logger:
+        def info(self, *args, **kwargs): calls.append("logged")
+        def error(self, *args, **kwargs): calls.append("error")
+        def flush(self): calls.append("flushed")
+
+    app = TrayApp.__new__(TrayApp)
+    app.config = types.SimpleNamespace(logs_dir=str(tmp_path))
+    app.log = Logger()
+    app._stop = threading.Event()
+    app.engine = types.SimpleNamespace(request_shutdown=lambda: calls.append("engine-stopped"))
+    app._status_window = types.SimpleNamespace(stop=lambda: calls.append("window-stopped"))
+    app._icon = types.SimpleNamespace(stop=lambda: calls.append("icon-stopped"))
+    app._restart_requested = False
+    monkeypatch.setattr("oiiaw.tray.autostart._locate_tray_exe", lambda: r"C:\Python\oiiaw-tray.exe")
+    monkeypatch.setattr("oiiaw.tray.launch_update_helper", lambda *args: True)
+
+    assert app._begin_update("0.1.4") is True
+    assert app._stop.is_set()
+    assert app._restart_requested is False
+    assert "engine-stopped" in calls
+    assert "icon-stopped" in calls

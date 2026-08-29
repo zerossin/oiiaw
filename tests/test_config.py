@@ -24,3 +24,8 @@ def test_nested_vault_paths_are_rejected(tmp_path):
     assert paths_overlap(str(local), str(cloud)) is True
     config = Config({"paths": {"local_vault": str(local), "cloud_vault": str(cloud)}})
     assert any(problem.blocking and "contain each other" in problem.message for problem in config.validate())
+
+
+def test_auto_update_defaults_on_and_can_be_disabled():
+    assert Config({}).auto_update is True
+    assert Config({"updates": {"enabled": False}}).auto_update is False

@@ -19,6 +19,7 @@ import pystray
 from . import autostart
 from .sync_engine import SyncEngine
 from .status_file import StatusReporter
+from .updater import AutoUpdater, launch_update_helper
 from .ui_assets import apply_window_icon, configure_windows_app_identity, tray_icon
 
 _COLORS = {
@@ -299,6 +300,29 @@ class TrayApp:
         self._restart_requested = True
         self._quit(icon, item)
 
+    def _sync_is_idle(self) -> bool:
+        status = StatusReporter.read(self.config.logs_dir)
+        return bool(
+            StatusReporter.is_fresh(status)
+            and status.get("state") == "idle"
+            and status.get("pending", 0) == 0
+        )
+
+    def _begin_update(self, version: str) -> bool:
+        tray_exe = autostart._locate_tray_exe()
+        if not tray_exe or not launch_update_helper(version, tray_exe, self.config.logs_dir):
+            self.log.error("UPDATE", f"could not launch updater for {version}", level="important")
+            return False
+        self.log.info("UPDATE", f"installing oiiaw {version}; restarting automatically", level="important")
+        self.log.flush()
+        # The detached helper owns the relaunch after this process releases
+        # the running oiiaw-tray.exe file.
+        self._stop.set()
+        self.engine.request_shutdown()
+        self._status_window.stop()
+        self._icon.stop()
+        return True
+
     def _relaunch(self):
         # Wipe the heartbeat file first — the new process's own duplicate-
         # instance check would otherwise see this one's last (still-fresh)
@@ -341,6 +365,15 @@ class TrayApp:
         threading.Thread(target=self._refresh_loop, daemon=True).start()
         window_thread = threading.Thread(target=self._status_window.run, daemon=True)
         window_thread.start()
+        if getattr(self.config, "auto_update", True):
+            updater = AutoUpdater(
+                self.log,
+                self._stop,
+                self._sync_is_idle,
+                self._begin_update,
+                getattr(self.config, "update_check_interval", 86400),
+            )
+            threading.Thread(target=updater.run, daemon=True).start()
         self._icon.run()
         self._stop.set()
         self.engine.request_shutdown()

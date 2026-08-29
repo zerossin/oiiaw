@@ -24,6 +24,10 @@ logging:
   console_level: "normal" # quiet | normal | verbose
   log_retention: 10
 
+updates:
+  enabled: true
+  check_interval: 86400  # seconds; once per day
+
 ignore:
   dirs: [".trash", ".fseventsd", ".spotlight-v100", ".apdisk"]
   files: [".ds_store", "workspace.json", "workspace-mobile.json"]

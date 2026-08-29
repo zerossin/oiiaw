@@ -52,6 +52,10 @@ class Config:
         self.console_level = logging_cfg.get("console_level", "normal")
         self.log_retention = logging_cfg.get("log_retention", 10)
 
+        updates = data.get("updates", {})
+        self.auto_update = updates.get("enabled", True)
+        self.update_check_interval = updates.get("check_interval", 86400)
+
         ignore = data.get("ignore", {})
         self.ignored_dirs = {d.lower() for d in ignore.get("dirs", [])}
         self.ignored_files = {f.lower() for f in ignore.get("files", [])}
