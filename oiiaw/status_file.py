@@ -10,9 +10,15 @@ doing" reads that file instead of reaching into the daemon directly.
 import os
 import json
 import time
+import threading
 from collections import deque
 
 HISTORY_LIMIT = 50
+# Windows can reject os.replace while another thread has status.json open.
+# Serialize local readers and briefly retry races with external status readers.
+_STATUS_LOCK = threading.Lock()
+_REPLACE_ATTEMPTS = 3
+_REPLACE_RETRY_DELAY = 0.05
 
 
 class StatusReporter:
@@ -33,9 +39,9 @@ class StatusReporter:
         elif event_type in ("ERROR", "PROBE_TIMEOUT", "PROBE_ERROR"):
             self.error_count += 1
 
-    def write(self, state: str, pending: int, parked: int = 0):
+    def write(self, state: str, pending: int, parked: int = 0) -> bool:
         if not self._path:
-            return
+            return False
         data = {
             "pid": self.pid,
             "started_at": self.started_at,
@@ -49,19 +55,32 @@ class StatusReporter:
             "error_count": self.error_count,
         }
         tmp = self._path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, self._path)
+        with _STATUS_LOCK:
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                for attempt in range(_REPLACE_ATTEMPTS):
+                    try:
+                        os.replace(tmp, self._path)
+                        return True
+                    except PermissionError:
+                        if attempt == _REPLACE_ATTEMPTS - 1:
+                            return False
+                        time.sleep(_REPLACE_RETRY_DELAY)
+            except OSError:
+                return False
+        return False
 
     @staticmethod
     def read(logs_dir: str | None) -> dict | None:
         if not logs_dir:
             return None
-        try:
-            with open(os.path.join(logs_dir, "status.json"), "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return None
+        with _STATUS_LOCK:
+            try:
+                with open(os.path.join(logs_dir, "status.json"), "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, json.JSONDecodeError):
+                return None
 
     @staticmethod
     def is_fresh(status: dict | None, max_age: float = 10.0) -> bool:
