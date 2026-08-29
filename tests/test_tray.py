@@ -8,6 +8,7 @@ from two instances racing.
 
 import os
 import json
+import time
 import types
 
 from oiiaw.tray import StatusWindow, TrayApp
@@ -43,3 +44,11 @@ def test_status_window_stop_is_thread_safe_and_idempotent():
     window.stop()
 
     assert window._stop_event.is_set()
+
+
+def test_stale_heartbeat_uses_error_icon():
+    app = TrayApp.__new__(TrayApp)
+    stale = {"updated_at": time.time() - 60, "last_event": None, "state": "idle"}
+
+    assert app._icon_state(stale) == "error"
+    assert app._tooltip(stale) == "oiiaw — 동기화 엔진 응답 없음"

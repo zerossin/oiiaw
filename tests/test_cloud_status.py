@@ -9,10 +9,13 @@ silently regress; they don't re-verify the raw ctypes plumbing, which needs
 a real Windows cloud-sync folder to exercise at all.
 """
 
+import asyncio
 import os
 from unittest.mock import patch
 
-from oiiaw.cloud_status import CloudFilter, PlaceholderInfo, PinState
+import pytest
+
+from oiiaw.cloud_status import CloudFilter, CloudProbe, CloudProbeError, CloudProbeTimeout, PlaceholderInfo, PinState
 
 
 def make_filter():
@@ -53,3 +56,79 @@ def test_genuinely_empty_file_is_available(getsize):
     info = PlaceholderInfo(on_disk_bytes=0, validated_bytes=0, pin_state=PinState.UNPINNED, in_sync=True)
     with patch.object(cf, "get_placeholder_info", return_value=info):
         assert cf.is_content_available("C:/fake/empty.md") is True
+
+
+class FakeProcess:
+    def __init__(self):
+        self.alive = True
+        self.terminated = False
+
+    def is_alive(self):
+        return self.alive
+
+    def terminate(self):
+        self.terminated = True
+        self.alive = False
+
+    def join(self, timeout=None):
+        pass
+
+    def kill(self):
+        self.alive = False
+
+
+class FakeConnection:
+    def __init__(self, response=None):
+        self.response = response
+        self.sent = []
+        self.closed = False
+
+    def send(self, value):
+        self.sent.append(value)
+
+    def poll(self, timeout=None):
+        return self.response is not None
+
+    def recv(self):
+        return self.response
+
+    def close(self):
+        self.closed = True
+
+
+def make_probe(connection, process, timeout=0.01):
+    probe = CloudProbe(timeout_seconds=timeout)
+    probe._connection = connection
+    probe._process = process
+    return probe
+
+
+def test_isolated_probe_returns_worker_result():
+    connection = FakeConnection(("ok", False))
+    process = FakeProcess()
+    probe = make_probe(connection, process)
+
+    assert asyncio.run(probe.is_content_available("C:/cloud/offline.md")) is False
+    assert connection.sent == ["C:/cloud/offline.md"]
+    assert process.terminated is False
+    probe.close()
+
+
+def test_isolated_probe_timeout_terminates_stuck_worker():
+    connection = FakeConnection()
+    process = FakeProcess()
+    probe = make_probe(connection, process)
+
+    with pytest.raises(CloudProbeTimeout):
+        asyncio.run(probe.is_content_available("C:/cloud/stuck.md"))
+
+    assert process.terminated is True
+    assert connection.closed is True
+    assert probe._process is None
+
+
+def test_isolated_probe_surfaces_worker_error():
+    probe = make_probe(FakeConnection(("error", "provider failed")), FakeProcess())
+
+    with pytest.raises(CloudProbeError, match="provider failed"):
+        asyncio.run(probe.is_content_available("C:/cloud/broken.md"))

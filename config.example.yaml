@@ -11,8 +11,7 @@ sync:
   stability_window: 3
   stabilize_wait: 8
   cooldown_seconds: 3
-  backoff_seconds: 30
-  backoff_max_seconds: 300
+  cloud_probe_timeout: 5
   big_file_threshold: 102400
   big_file_cooldown: 30
 

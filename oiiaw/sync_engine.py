@@ -9,8 +9,10 @@ serializes each path and coalesces events received while it is active. This
 keeps memory bounded by the number of paths currently needing work, with no
 per-file worker or idle-cleanup task.
 
-Anything that can't be acted on right now (cloud content not hydrated yet,
-a file still being written, or an active cooldown) gets a scheduled retry.
+Anything that can't be acted on right now (a file still being written or an
+active cooldown) gets a scheduled retry. Offline cloud placeholders are
+parked until watchdog reports a real filesystem change instead of polling
+them forever.
 Filesystem events that arrive while the same path is being processed are
 coalesced into one follow-up pass instead of being dropped or run concurrently.
 
@@ -35,7 +37,7 @@ from dataclasses import dataclass, field
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-from .cloud_status import CloudFilter
+from .cloud_status import CloudProbe, CloudProbeError, CloudProbeTimeout
 from .status_file import StatusReporter
 
 
@@ -70,31 +72,6 @@ def trash_move(vault_root: str, rel_path: str):
         dst = f"{stem}_{time.strftime('%Y%m%d_%H%M%S')}{ext}"
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.move(src, dst)
-
-
-@dataclass
-class Backoff:
-    base_seconds: float
-    max_seconds: float
-    _until: dict = field(default_factory=dict)
-    _streak: dict = field(default_factory=dict)
-
-    def is_active(self, key: str) -> bool:
-        return self.remaining(key) > 0
-
-    def remaining(self, key: str) -> float:
-        return max(0.0, self._until.get(key, 0) - time.time())
-
-    def bump(self, key: str) -> float:
-        n = self._streak.get(key, 0) + 1
-        self._streak[key] = n
-        delay = min(self.base_seconds * (2 ** (n - 1)), self.max_seconds)
-        self._until[key] = time.time() + delay
-        return delay
-
-    def reset(self, key: str):
-        self._streak.pop(key, None)
-        self._until.pop(key, None)
 
 
 @dataclass
@@ -154,14 +131,14 @@ class SyncEngine:
     def __init__(self, config, logger, worker_count: int = 4):
         self.config = config
         self.log = logger
-        self.cloud = CloudFilter()
-        self.backoff = Backoff(config.backoff_seconds, config.backoff_max_seconds)
+        self.cloud = CloudProbe(getattr(config, "cloud_probe_timeout", 5))
         self.cooldown = Cooldown(config.cooldown_seconds, config.big_file_cooldown, config.big_file_threshold)
         self.worker_count = worker_count
         self.pending: asyncio.Queue[str] = asyncio.Queue()
         self.queued: set[str] = set()
         self.in_flight: set[str] = set()
         self.dirty: set[str] = set()
+        self.parked: set[str] = set()
         self._retry_handles: dict[str, asyncio.TimerHandle] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.status = StatusReporter(getattr(config, "logs_dir", None))
@@ -205,7 +182,11 @@ class SyncEngine:
 
     # ── queue plumbing ──
 
-    def enqueue(self, rel_path: str):
+    def enqueue(self, rel_path: str, wake_parked: bool = False):
+        if wake_parked:
+            self.parked.discard(rel_path)
+        elif rel_path in self.parked:
+            return
         if rel_path in self.in_flight:
             self.dirty.add(rel_path)
             return
@@ -243,7 +224,7 @@ class SyncEngine:
         rel = self._relativize(abs_path, root)
         if rel is None or not self.is_tracked(rel) or self.loop is None:
             return
-        self.loop.call_soon_threadsafe(self.enqueue, rel)
+        self.loop.call_soon_threadsafe(self.enqueue, rel, True)
 
     def start_watching(self) -> Observer:
         observer = Observer()
@@ -278,7 +259,7 @@ class SyncEngine:
                 self.pending.task_done()
                 if rel_path in self.dirty:
                     self.dirty.discard(rel_path)
-                    self.enqueue(rel_path)
+                    self.enqueue(rel_path, True)
 
     # ── three-way sync decision ──
 
@@ -306,7 +287,7 @@ class SyncEngine:
 
     async def sync_one(self, rel_path: str):
         config = self.config
-        blocked_for = max(self.backoff.remaining(rel_path), self.cooldown.remaining(rel_path))
+        blocked_for = self.cooldown.remaining(rel_path)
         if blocked_for > 0:
             self._schedule_retry(rel_path, blocked_for)
             return
@@ -317,12 +298,21 @@ class SyncEngine:
         baseline = os.path.join(config.sync_baseline, rel_path)
         local_exists, cloud_exists, baseline_exists = os.path.exists(local), os.path.exists(cloud), os.path.exists(baseline)
 
-        if cloud_exists and not self.cloud.is_content_available(cloud):
-            delay = self.backoff.bump(rel_path)
-            self._schedule_retry(rel_path, delay)
-            self.log.info("WAIT", f"{rel_path} — cloud content not fully on disk yet, retry in {delay:.0f}s", level="verbose")
-            return
-        self.backoff.reset(rel_path)
+        if cloud_exists:
+            try:
+                cloud_available = await self.cloud.is_content_available(cloud)
+            except CloudProbeTimeout as exc:
+                self.parked.add(rel_path)
+                self.log.error("TIMEOUT", f"{rel_path} — {exc}; parked until the file changes", level="important")
+                return "PROBE_TIMEOUT"
+            except CloudProbeError as exc:
+                self.parked.add(rel_path)
+                self.log.error("PROBE", f"{rel_path} — {exc}; parked until the file changes", level="important")
+                return "PROBE_ERROR"
+            if not cloud_available:
+                self.parked.add(rel_path)
+                self.log.info("PARK", f"{rel_path} — cloud content is offline; waiting for a filesystem change", level="verbose")
+                return "PARK"
 
         if not local_exists and not cloud_exists:
             if baseline_exists:
@@ -430,7 +420,7 @@ class SyncEngine:
                 self.enqueue(rel)
             while not self._shutdown_event.is_set():
                 state = "syncing" if self.active > 0 or not self.pending.empty() else "idle"
-                self.status.write(state, self.pending.qsize())
+                self.status.write(state, self.pending.qsize(), len(self.parked))
                 self.log.flush()
                 try:
                     await asyncio.wait_for(self._shutdown_event.wait(), timeout=2)
@@ -442,5 +432,6 @@ class SyncEngine:
             for handle in self._retry_handles.values():
                 handle.cancel()
             self._retry_handles.clear()
+            self.cloud.close()
             observer.stop()
             observer.join()

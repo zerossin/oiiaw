@@ -30,10 +30,10 @@ class StatusReporter:
         self._history.append(self.last_event)
         if event_type == "CONFLICT":
             self.conflict_count += 1
-        elif event_type == "ERROR":
+        elif event_type in ("ERROR", "PROBE_TIMEOUT", "PROBE_ERROR"):
             self.error_count += 1
 
-    def write(self, state: str, pending: int):
+    def write(self, state: str, pending: int, parked: int = 0):
         if not self._path:
             return
         data = {
@@ -42,6 +42,7 @@ class StatusReporter:
             "updated_at": time.time(),
             "state": state,
             "pending": pending,
+            "parked": parked,
             "last_event": self.last_event,
             "history": list(self._history),
             "conflict_count": self.conflict_count,

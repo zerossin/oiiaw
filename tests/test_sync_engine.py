@@ -15,6 +15,7 @@ import types
 import pytest
 
 from oiiaw.sync_engine import SyncEngine, _Watcher
+from oiiaw.cloud_status import CloudProbeError, CloudProbeTimeout
 
 
 def make_config(tmp_path):
@@ -25,8 +26,7 @@ def make_config(tmp_path):
         ignored_dirs=set(),
         ignored_files=set(),
         ignore_patterns=[],
-        backoff_seconds=0.01,
-        backoff_max_seconds=0.02,
+        cloud_probe_timeout=0.02,
         cooldown_seconds=0.01,
         big_file_threshold=102400,
         big_file_cooldown=0.01,
@@ -48,7 +48,11 @@ def engine(tmp_path, monkeypatch):
     for d in (cfg.local_vault, cfg.cloud_vault, cfg.sync_baseline):
         os.makedirs(d)
     eng = SyncEngine(cfg, NullLogger())
-    monkeypatch.setattr(eng.cloud, "is_content_available", lambda path: True)
+
+    async def available(path):
+        return True
+
+    monkeypatch.setattr(eng.cloud, "is_content_available", available)
     return eng
 
 
@@ -166,21 +170,55 @@ def test_cooldown_event_gets_a_delayed_retry(engine):
     asyncio.run(scenario())
 
 
-def test_unavailable_cloud_file_gets_a_delayed_retry(engine, monkeypatch):
+def test_unavailable_cloud_file_is_parked_until_a_filesystem_event(engine, monkeypatch):
     cloud = os.path.join(engine.config.cloud_vault, "offline.md")
     with open(cloud, "w") as f:
         f.write("cloud content that is not hydrated yet")
-    monkeypatch.setattr(engine.cloud, "is_content_available", lambda path: False)
+
+    async def unavailable(path):
+        return False
+
+    monkeypatch.setattr(engine.cloud, "is_content_available", unavailable)
 
     async def scenario():
         engine.loop = asyncio.get_running_loop()
-        await engine.sync_one("offline.md")
-        assert "offline.md" in engine._retry_handles
+        event = await engine.sync_one("offline.md")
+        assert event == "PARK"
+        assert "offline.md" in engine.parked
+        assert "offline.md" not in engine._retry_handles
 
         await asyncio.sleep(0.03)
+        assert "offline.md" not in engine.queued
+
+        engine.enqueue("offline.md", wake_parked=True)
+        assert "offline.md" not in engine.parked
         assert "offline.md" in engine.queued
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("exception", "event_type"),
+    [
+        (CloudProbeTimeout("stuck"), "PROBE_TIMEOUT"),
+        (CloudProbeError("failed"), "PROBE_ERROR"),
+    ],
+)
+def test_cloud_probe_failure_is_parked_without_blocking(engine, monkeypatch, exception, event_type):
+    cloud = os.path.join(engine.config.cloud_vault, "offline.md")
+    with open(cloud, "w") as f:
+        f.write("cloud content")
+
+    async def fail(path):
+        raise exception
+
+    monkeypatch.setattr(engine.cloud, "is_content_available", fail)
+
+    event = asyncio.run(engine.sync_one("offline.md"))
+
+    assert event == event_type
+    assert "offline.md" in engine.parked
+    assert "offline.md" not in engine._retry_handles
 
 
 def test_events_during_sync_are_coalesced_not_run_concurrently(engine):

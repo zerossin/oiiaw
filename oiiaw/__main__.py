@@ -92,7 +92,10 @@ def cmd_status(args):
     status = StatusReporter.read(config.logs_dir)
     if StatusReporter.is_fresh(status):
         uptime = int(time.time() - status["started_at"])
-        print(f"daemon: running (pid {status['pid']}, uptime {uptime}s, state={status['state']}, pending={status['pending']})")
+        print(
+            f"daemon: running (pid {status['pid']}, uptime {uptime}s, "
+            f"state={status['state']}, pending={status['pending']}, parked={status.get('parked', 0)})"
+        )
         last = status.get("last_event")
         if last:
             print(f"  last event: {last['type']} {last['path']} ({int(time.time() - last['time'])}s ago)")

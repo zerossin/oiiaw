@@ -11,6 +11,8 @@ just written from memory — see tests/test_cloud_status.py.
 """
 
 import ctypes
+import asyncio
+import multiprocessing
 import os
 import platform
 from dataclasses import dataclass
@@ -58,6 +60,14 @@ class PlaceholderInfo:
 
 class CloudFilterUnavailable(Exception):
     """Raised when the Cloud Filter API isn't usable on this system at all."""
+
+
+class CloudProbeTimeout(TimeoutError):
+    """The isolated Windows cloud-status probe stopped responding."""
+
+
+class CloudProbeError(RuntimeError):
+    """The isolated probe exited or returned an unexpected failure."""
 
 
 def _load_cldapi():
@@ -154,3 +164,98 @@ class CloudFilter:
         except OSError:
             return False
         return info.on_disk_bytes >= full_size
+
+
+def _probe_worker(connection):
+    """Runs unsafe provider calls outside the sync process's event loop.
+
+    A cloud provider can block inside CreateFileW/CfGetPlaceholderInfo without
+    raising. The parent can terminate this process; it cannot safely terminate
+    a stuck Python thread.
+    """
+    cloud_filter = CloudFilter()
+    try:
+        while True:
+            try:
+                path = connection.recv()
+            except EOFError:
+                return
+            if path is None:
+                return
+            try:
+                connection.send(("ok", cloud_filter.is_content_available(path)))
+            except BaseException as exc:
+                connection.send(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        connection.close()
+
+
+class CloudProbe:
+    """Async facade over one disposable cloud-status helper process."""
+
+    def __init__(self, timeout_seconds: float = 5.0, context=None):
+        self.timeout_seconds = timeout_seconds
+        self._context = context or multiprocessing.get_context("spawn")
+        self._connection = None
+        self._process = None
+        self._lock: asyncio.Lock | None = None
+
+    def _ensure_worker(self):
+        if self._process is not None and self._process.is_alive():
+            return
+        self._discard_worker()
+        parent, child = self._context.Pipe()
+        process = self._context.Process(
+            target=_probe_worker,
+            args=(child,),
+            name="oiiaw-cloud-probe",
+            daemon=True,
+        )
+        process.start()
+        child.close()
+        self._connection = parent
+        self._process = process
+
+    def _discard_worker(self):
+        connection, process = self._connection, self._process
+        self._connection = None
+        self._process = None
+        if connection is not None:
+            connection.close()
+        if process is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=0.2)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=0.2)
+
+    async def is_content_available(self, path: str) -> bool:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            self._ensure_worker()
+            try:
+                self._connection.send(str(path))
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                self._discard_worker()
+                raise CloudProbeError(f"could not contact cloud probe: {exc}") from exc
+
+            # Pipe polling has its own hard timeout and wakes immediately on a
+            # response. Running only that bounded wait in a thread avoids both
+            # event-loop blocking and a 50 ms polling tax for every vault file.
+            ready = await asyncio.to_thread(self._connection.poll, self.timeout_seconds)
+            if not ready:
+                self._discard_worker()
+                raise CloudProbeTimeout(f"cloud probe exceeded {self.timeout_seconds:.1f}s")
+            try:
+                kind, payload = self._connection.recv()
+            except (EOFError, OSError) as exc:
+                self._discard_worker()
+                raise CloudProbeError(f"cloud probe exited: {exc}") from exc
+            if kind == "ok":
+                return bool(payload)
+            raise CloudProbeError(str(payload))
+
+    def close(self):
+        self._discard_worker()

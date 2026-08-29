@@ -105,17 +105,24 @@ class StatusWindow:
 
     def _refresh(self):
         status = StatusReporter.read(self.config.logs_dir)
-        if not status or not StatusReporter.is_fresh(status):
+        if not status:
             self.state_label.config(text="상태: 시작 중...")
             self.paths_label.config(text="")
+            return
+        if not StatusReporter.is_fresh(status):
+            age = int(time.time() - status.get("updated_at", 0))
+            self.state_label.config(text=f"상태: 동기화 엔진 응답 없음  ·  {age}초째", fg="#b23a2e")
+            self.paths_label.config(text=f"로컬: {self.config.local_vault}\niCloud: {self.config.cloud_vault}")
             return
 
         state_kr = self._STATE_KR.get(status["state"], status["state"])
         uptime_min = int((time.time() - status["started_at"]) // 60)
         summary = f"상태: {state_kr}  ·  대기 {status['pending']}개  ·  {uptime_min}분째 실행 중"
+        if status.get("parked"):
+            summary += f"  ·  오프라인 보류 {status['parked']}개"
         if status.get("conflict_count"):
             summary += f"  ·  충돌 {status['conflict_count']}건"
-        self.state_label.config(text=summary)
+        self.state_label.config(text=summary, fg="#000000")
         self.paths_label.config(text=f"로컬: {self.config.local_vault}\niCloud: {self.config.cloud_vault}")
 
         self.history_list.delete(0, tk.END)
@@ -148,9 +155,13 @@ class TrayApp:
         )
 
     def _tooltip(self, status: dict | None) -> str:
-        if not status or not StatusReporter.is_fresh(status):
+        if not status:
             return "oiiaw — 시작 중..."
+        if not StatusReporter.is_fresh(status):
+            return "oiiaw — 동기화 엔진 응답 없음"
         lines = [f"oiiaw — {status['state']}"]
+        if status.get("parked"):
+            lines.append(f"오프라인 보류 {status['parked']}개")
         last = status.get("last_event")
         if last:
             lines.append(f"최근: {last['type']} {last['path']}")
@@ -159,10 +170,12 @@ class TrayApp:
         return "\n".join(lines)
 
     def _icon_state(self, status: dict | None) -> str:
-        if not status or not StatusReporter.is_fresh(status):
+        if not status:
             return "idle"
+        if not StatusReporter.is_fresh(status):
+            return "error"
         last = status.get("last_event")
-        if last and last["type"] in ("CONFLICT", "ERROR") and time.time() - last["time"] < 300:
+        if last and last["type"] in ("CONFLICT", "ERROR", "PROBE_TIMEOUT", "PROBE_ERROR") and time.time() - last["time"] < 300:
             return "conflict"
         return status.get("state", "idle")
 
