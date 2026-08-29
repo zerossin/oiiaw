@@ -31,8 +31,8 @@ class StatusReporter:
         self.last_event: dict | None = None
         self._history: deque = deque(maxlen=HISTORY_LIMIT)
 
-    def record_event(self, event_type: str, rel_path: str):
-        self.last_event = {"type": event_type, "path": rel_path, "time": time.time()}
+    def record_event(self, event_type: str, rel_path: str, **details):
+        self.last_event = {"type": event_type, "path": rel_path, "time": time.time(), **details}
         self._history.append(self.last_event)
         if event_type == "CONFLICT":
             self.conflict_count += 1

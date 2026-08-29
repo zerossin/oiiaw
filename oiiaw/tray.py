@@ -11,6 +11,8 @@ import time
 import asyncio
 import threading
 import tkinter as tk
+from urllib.parse import quote
+from tkinter import messagebox
 
 import pystray
 
@@ -29,6 +31,29 @@ _COLORS = {
 _REFRESH_SECONDS = 2
 _ENGINE_RETRY_INITIAL = 2
 _ENGINE_RETRY_MAX = 60
+
+
+def open_document(path: str) -> bool:
+    """Open Markdown in Obsidian; use the Windows default app otherwise."""
+    if not path or not os.path.isfile(path):
+        return False
+    target = path
+    if os.path.splitext(path)[1].lower() == ".md":
+        target = f"obsidian://open?path={quote(os.path.abspath(path), safe='')}"
+    try:
+        os.startfile(target)
+        return True
+    except OSError:
+        return False
+
+
+def conflict_event_paths(config, event: dict | None) -> tuple[str | None, str | None]:
+    if not event or event.get("type") != "CONFLICT":
+        return None, None
+    current = os.path.join(config.local_vault, event.get("path", ""))
+    conflict_rel = event.get("conflict_path")
+    conflict = os.path.join(config.local_vault, conflict_rel) if conflict_rel else None
+    return current, conflict
 
 
 class StatusWindow:
@@ -74,7 +99,7 @@ class StatusWindow:
         self.root = tk.Tk()
         apply_window_icon(self.root)
         self.root.title("oiiaw 상태")
-        self.root.geometry("420x420")
+        self.root.geometry("460x470")
         self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
 
         self.state_label = tk.Label(self.root, text="", font=("Segoe UI", 11, "bold"), anchor="w", justify="left")
@@ -92,6 +117,26 @@ class StatusWindow:
         self.history_list = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, font=("Consolas", 9))
         self.history_list.pack(side="left", fill="both", expand=True)
         scrollbar.config(command=self.history_list.yview)
+        self.history_list.bind("<<ListboxSelect>>", self._on_history_select)
+        self.history_list.bind("<Double-Button-1>", lambda event: self._open_selected("current"))
+
+        action_frame = tk.Frame(self.root)
+        action_frame.pack(fill="x", padx=12, pady=(0, 8))
+        self.current_button = tk.Button(
+            action_frame, text="현재 문서 열기", state="disabled",
+            command=lambda: self._open_selected("current"),
+        )
+        self.current_button.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        self.conflict_button = tk.Button(
+            action_frame, text="충돌본 열기", state="disabled",
+            command=lambda: self._open_selected("conflict"),
+        )
+        self.conflict_button.pack(side="left", expand=True, fill="x", padx=4)
+        self.folder_button = tk.Button(
+            action_frame, text="파일 위치 열기", state="disabled",
+            command=lambda: self._open_selected("folder"),
+        )
+        self.folder_button.pack(side="left", expand=True, fill="x", padx=(4, 0))
 
         tk.Button(self.root, text="로그 폴더 열기", command=self._open_logs).pack(pady=(0, 12))
 
@@ -99,6 +144,31 @@ class StatusWindow:
         self._poll()
         self.root.mainloop()
         self.root = None
+
+    def _selected_event(self) -> dict | None:
+        selection = self.history_list.curselection()
+        if not selection or selection[0] >= len(getattr(self, "_displayed_events", [])):
+            return None
+        return self._displayed_events[selection[0]]
+
+    def _on_history_select(self, event=None):
+        current, conflict = conflict_event_paths(self.config, self._selected_event())
+        self.current_button.config(state="normal" if current and os.path.isfile(current) else "disabled")
+        self.conflict_button.config(state="normal" if conflict and os.path.isfile(conflict) else "disabled")
+        folder_target = conflict if conflict and os.path.isfile(conflict) else current
+        self.folder_button.config(state="normal" if folder_target and os.path.exists(folder_target) else "disabled")
+
+    def _open_selected(self, which: str):
+        current, conflict = conflict_event_paths(self.config, self._selected_event())
+        path = conflict if which == "conflict" else current
+        if which == "folder":
+            path = conflict if conflict and os.path.exists(conflict) else current
+            if path and os.path.exists(path):
+                os.startfile(os.path.dirname(path))
+                return
+        elif open_document(path):
+            return
+        messagebox.showinfo("oiiaw", "파일이 아직 동기화 중이거나 더 이상 존재하지 않습니다.")
 
     def _open_logs(self):
         os.makedirs(self.config.logs_dir, exist_ok=True)
@@ -119,6 +189,8 @@ class StatusWindow:
         self.root.after(1000, self._poll)
 
     def _refresh(self):
+        selected = self._selected_event()
+        selected_time = selected.get("time") if selected else None
         status = StatusReporter.read(self.config.logs_dir)
         if not status:
             self.state_label.config(text="상태: 시작 중...")
@@ -141,13 +213,19 @@ class StatusWindow:
         self.paths_label.config(text=f"로컬: {self.config.local_vault}\niCloud: {self.config.cloud_vault}")
 
         self.history_list.delete(0, tk.END)
-        history = status.get("history") or []
-        for event in reversed(history):
+        self._displayed_events = list(reversed(status.get("history") or []))
+        selected_index = None
+        for index, event in enumerate(self._displayed_events):
             stamp = time.strftime("%H:%M:%S", time.localtime(event["time"]))
             event_name = self._EVENT_KR.get(event["type"], event["type"])
             self.history_list.insert(tk.END, f"{stamp}  {event_name:<14} {event['path']}")
-        if not history:
+            if selected_time == event.get("time"):
+                selected_index = index
+        if not self._displayed_events:
             self.history_list.insert(tk.END, "(아직 활동 없음)")
+        elif selected_index is not None:
+            self.history_list.selection_set(selected_index)
+        self._on_history_select()
 
 
 class TrayApp:

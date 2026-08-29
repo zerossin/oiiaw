@@ -12,7 +12,7 @@ import threading
 import time
 import types
 
-from oiiaw.tray import StatusWindow, TrayApp
+from oiiaw.tray import StatusWindow, TrayApp, conflict_event_paths, open_document
 from oiiaw.status_file import StatusReporter
 
 
@@ -92,3 +92,25 @@ def test_engine_is_rebuilt_after_unexpected_exit(monkeypatch):
 
     assert isinstance(app.engine, RecoveredEngine)
     assert errors and errors[0][0] == "ENGINE"
+
+
+def test_markdown_document_opens_with_absolute_obsidian_uri(tmp_path, monkeypatch):
+    note = tmp_path / "한 글.md"
+    note.write_text("content", encoding="utf-8")
+    opened = []
+    monkeypatch.setattr("oiiaw.tray.os.startfile", opened.append)
+
+    assert open_document(str(note)) is True
+    assert opened[0].startswith("obsidian://open?path=")
+    assert "%20" in opened[0]
+
+
+def test_conflict_event_resolves_local_current_and_backup_paths(tmp_path):
+    config = types.SimpleNamespace(local_vault=str(tmp_path))
+    current, conflict = conflict_event_paths(
+        config,
+        {"type": "CONFLICT", "path": "notes/note.md", "conflict_path": "notes/note_CONFLICT_1.md"},
+    )
+
+    assert current == os.path.join(str(tmp_path), "notes/note.md")
+    assert conflict == os.path.join(str(tmp_path), "notes/note_CONFLICT_1.md")

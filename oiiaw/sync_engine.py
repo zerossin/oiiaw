@@ -74,6 +74,18 @@ def trash_move(vault_root: str, rel_path: str):
     shutil.move(src, dst)
 
 
+def conflict_backup_path(path: str) -> str:
+    """Keep the real extension so Markdown backups remain openable notes."""
+    stem, ext = os.path.splitext(path)
+    base = f"{stem}_CONFLICT_{time.strftime('%Y%m%d_%H%M%S')}"
+    candidate = base + ext
+    counter = 2
+    while os.path.exists(candidate):
+        candidate = f"{base}_{counter}{ext}"
+        counter += 1
+    return candidate
+
+
 @dataclass
 class Cooldown:
     """After a successful push/pull, defer repeat events for this path for a
@@ -282,7 +294,11 @@ class SyncEngine:
                 event = await self.sync_one(rel_path)
                 self._error_attempts.pop(rel_path, None)
                 if event:
-                    self.status.record_event(event, rel_path)
+                    if isinstance(event, tuple):
+                        event_type, details = event
+                        self.status.record_event(event_type, rel_path, **details)
+                    else:
+                        self.status.record_event(event, rel_path)
                 elif was_retrying:
                     self.log.success("RECOVERED", rel_path, level="verbose")
                     self.status.record_event("RECOVERED", rel_path)
@@ -452,14 +468,16 @@ class SyncEngine:
                 self.log.info("RESOLVED", f"{rel_path} — settled to the same content while waiting", level="verbose")
                 return "RESOLVED"
             winner, loser = (local, cloud) if os.path.getmtime(local) >= os.path.getmtime(cloud) else (cloud, local)
-            backup = f"{loser}_CONFLICT_{time.strftime('%Y%m%d_%H%M%S')}"
+            loser_root = config.local_vault if loser == local else config.cloud_vault
+            backup = conflict_backup_path(loser)
+            backup_rel = os.path.normpath(os.path.relpath(backup, loser_root))
             shutil.copy2(loser, backup)
             atomic_copy(winner, local)
             atomic_copy(winner, cloud)
             atomic_copy(winner, baseline)
             self._start_cooldown(rel_path, winner)
             self.log.warn("CONFLICT", f"{rel_path} — kept newer, backed up loser", level="important")
-            return "CONFLICT"
+            return "CONFLICT", {"conflict_path": backup_rel}
 
     # ── main entry ──
 

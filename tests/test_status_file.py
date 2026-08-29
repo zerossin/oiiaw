@@ -16,6 +16,16 @@ def test_probe_timeout_is_counted_and_parked_count_is_reported(tmp_path):
     assert status["last_event"]["type"] == "PROBE_TIMEOUT"
 
 
+def test_event_details_are_written_for_conflict_actions(tmp_path):
+    reporter = StatusReporter(str(tmp_path))
+    reporter.record_event("CONFLICT", "note.md", conflict_path="note_CONFLICT_1.md")
+    reporter.write("idle", pending=0)
+
+    status = StatusReporter.read(str(tmp_path))
+
+    assert status["last_event"]["conflict_path"] == "note_CONFLICT_1.md"
+
+
 def test_write_retries_when_windows_temporarily_blocks_replace(tmp_path, monkeypatch):
     reporter = StatusReporter(str(tmp_path))
     real_replace = os.replace

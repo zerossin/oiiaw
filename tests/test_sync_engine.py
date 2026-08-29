@@ -14,7 +14,7 @@ import types
 
 import pytest
 
-from oiiaw.sync_engine import SyncEngine, _Watcher
+from oiiaw.sync_engine import SyncEngine, _Watcher, conflict_backup_path
 from oiiaw.cloud_status import CloudProbeError, CloudProbeTimeout
 
 
@@ -85,12 +85,27 @@ def test_genuinely_different_files_with_no_baseline_are_a_real_conflict(engine):
     with open(cloud, "w") as f:
         f.write("cloud version, long enough to pass the tiny threshold, but different")
 
-    asyncio.run(engine.sync_one("note.md"))
+    event = asyncio.run(engine.sync_one("note.md"))
 
     # the loser (older mtime) can end up on either side depending on write
     # timing, so check both instead of assuming which one lost.
     all_files = os.listdir(engine.config.local_vault) + os.listdir(engine.config.cloud_vault)
     assert any("_CONFLICT_" in f for f in all_files)
+    assert event[0] == "CONFLICT"
+    assert event[1]["conflict_path"].endswith(".md")
+    assert ".md_CONFLICT_" not in event[1]["conflict_path"]
+
+
+def test_conflict_backup_path_keeps_extension_and_avoids_collision(tmp_path, monkeypatch):
+    monkeypatch.setattr("oiiaw.sync_engine.time.strftime", lambda pattern: "20260829_120000")
+    original = tmp_path / "note.md"
+
+    first = conflict_backup_path(str(original))
+    open(first, "wb").close()
+    second = conflict_backup_path(str(original))
+
+    assert first.endswith("note_CONFLICT_20260829_120000.md")
+    assert second.endswith("note_CONFLICT_20260829_120000_2.md")
 
 
 def test_settled_true_when_size_unchanged(tmp_path):
