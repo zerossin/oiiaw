@@ -27,6 +27,9 @@ def make_config(tmp_path):
         ignored_files=set(),
         ignore_patterns=[],
         cloud_probe_timeout=0.02,
+        cloud_hydrate_timeout=0.02,
+        hydrate_retry_initial=0.01,
+        hydrate_retry_max=0.02,
         cooldown_seconds=0.01,
         big_file_threshold=102400,
         big_file_cooldown=0.01,
@@ -170,7 +173,7 @@ def test_cooldown_event_gets_a_delayed_retry(engine):
     asyncio.run(scenario())
 
 
-def test_unavailable_cloud_file_is_parked_until_a_filesystem_event(engine, monkeypatch):
+def test_unavailable_cloud_file_is_hydrated_and_synced(engine, monkeypatch):
     cloud = os.path.join(engine.config.cloud_vault, "offline.md")
     with open(cloud, "w") as f:
         f.write("cloud content that is not hydrated yet")
@@ -178,19 +181,46 @@ def test_unavailable_cloud_file_is_parked_until_a_filesystem_event(engine, monke
     async def unavailable(path):
         return False
 
+    hydrated = []
+
+    async def hydrate(path):
+        hydrated.append(path)
+        return True
+
     monkeypatch.setattr(engine.cloud, "is_content_available", unavailable)
+    monkeypatch.setattr(engine.cloud, "hydrate", hydrate)
+
+    event = asyncio.run(engine.sync_one("offline.md"))
+
+    assert event == "PULL"
+    assert hydrated == [cloud]
+    assert "offline.md" not in engine.parked
+    with open(os.path.join(engine.config.local_vault, "offline.md")) as f:
+        assert f.read() == "cloud content that is not hydrated yet"
+
+
+def test_failed_hydration_is_automatically_retried(engine, monkeypatch):
+    cloud = os.path.join(engine.config.cloud_vault, "offline.md")
+    with open(cloud, "w") as f:
+        f.write("cloud content that is not hydrated yet")
+
+    async def unavailable(path):
+        return False
+
+    async def hydration_pending(path):
+        return False
+
+    monkeypatch.setattr(engine.cloud, "is_content_available", unavailable)
+    monkeypatch.setattr(engine.cloud, "hydrate", hydration_pending)
 
     async def scenario():
         engine.loop = asyncio.get_running_loop()
         event = await engine.sync_one("offline.md")
         assert event == "PARK"
         assert "offline.md" in engine.parked
-        assert "offline.md" not in engine._retry_handles
+        assert "offline.md" in engine._retry_handles
 
-        await asyncio.sleep(0.03)
-        assert "offline.md" not in engine.queued
-
-        engine.enqueue("offline.md", wake_parked=True)
+        await asyncio.sleep(0.02)
         assert "offline.md" not in engine.parked
         assert "offline.md" in engine.queued
 
@@ -218,7 +248,7 @@ def test_cloud_probe_failure_is_parked_without_blocking(engine, monkeypatch, exc
 
     assert event == event_type
     assert "offline.md" in engine.parked
-    assert "offline.md" not in engine._retry_handles
+    assert "offline.md" in engine._retry_handles
 
 
 def test_events_during_sync_are_coalesced_not_run_concurrently(engine):

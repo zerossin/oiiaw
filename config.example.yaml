@@ -12,6 +12,9 @@ sync:
   stabilize_wait: 8
   cooldown_seconds: 3
   cloud_probe_timeout: 5
+  cloud_hydrate_timeout: 30
+  hydrate_retry_initial: 15
+  hydrate_retry_max: 300
   big_file_threshold: 102400
   big_file_cooldown: 30
 

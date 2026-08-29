@@ -58,6 +58,37 @@ def test_genuinely_empty_file_is_available(getsize):
         assert cf.is_content_available("C:/fake/empty.md") is True
 
 
+def test_hydrate_requests_the_complete_file_and_rechecks_availability():
+    class FakeKernel32:
+        def __init__(self):
+            self.closed = []
+
+        def CreateFileW(self, *_):
+            return 123
+
+        def CloseHandle(self, handle):
+            self.closed.append(handle)
+
+    class FakeCldApi:
+        def __init__(self):
+            self.calls = []
+
+        def CfHydratePlaceholder(self, *args):
+            self.calls.append(args)
+            return 0
+
+    cf = make_filter()
+    cf._k32 = FakeKernel32()
+    cf._cldapi = FakeCldApi()
+
+    with patch.object(cf, "is_content_available", return_value=True) as available:
+        assert cf.hydrate("C:/cloud/offline.md") is True
+
+    assert cf._cldapi.calls == [(123, 0, -1, 0, None)]
+    assert cf._k32.closed == [123]
+    available.assert_called_once_with("C:/cloud/offline.md")
+
+
 class FakeProcess:
     def __init__(self):
         self.alive = True
@@ -81,12 +112,14 @@ class FakeConnection:
     def __init__(self, response=None):
         self.response = response
         self.sent = []
+        self.poll_timeouts = []
         self.closed = False
 
     def send(self, value):
         self.sent.append(value)
 
     def poll(self, timeout=None):
+        self.poll_timeouts.append(timeout)
         return self.response is not None
 
     def recv(self):
@@ -96,8 +129,8 @@ class FakeConnection:
         self.closed = True
 
 
-def make_probe(connection, process, timeout=0.01):
-    probe = CloudProbe(timeout_seconds=timeout)
+def make_probe(connection, process, timeout=0.01, hydrate_timeout=0.02):
+    probe = CloudProbe(timeout_seconds=timeout, hydrate_timeout_seconds=hydrate_timeout)
     probe._connection = connection
     probe._process = process
     return probe
@@ -109,8 +142,20 @@ def test_isolated_probe_returns_worker_result():
     probe = make_probe(connection, process)
 
     assert asyncio.run(probe.is_content_available("C:/cloud/offline.md")) is False
-    assert connection.sent == ["C:/cloud/offline.md"]
+    assert connection.sent == [("available", "C:/cloud/offline.md")]
+    assert connection.poll_timeouts == [0.01]
     assert process.terminated is False
+    probe.close()
+
+
+def test_isolated_hydration_uses_its_longer_timeout():
+    connection = FakeConnection(("ok", True))
+    process = FakeProcess()
+    probe = make_probe(connection, process)
+
+    assert asyncio.run(probe.hydrate("C:/cloud/offline.md")) is True
+    assert connection.sent == [("hydrate", "C:/cloud/offline.md")]
+    assert connection.poll_timeouts == [0.02]
     probe.close()
 
 

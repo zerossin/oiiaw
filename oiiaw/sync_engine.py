@@ -11,8 +11,8 @@ per-file worker or idle-cleanup task.
 
 Anything that can't be acted on right now (a file still being written or an
 active cooldown) gets a scheduled retry. Offline cloud placeholders are
-parked until watchdog reports a real filesystem change instead of polling
-them forever.
+hydrated through an isolated helper process; failures are parked temporarily
+and retried with bounded backoff.
 Filesystem events that arrive while the same path is being processed are
 coalesced into one follow-up pass instead of being dropped or run concurrently.
 
@@ -131,7 +131,10 @@ class SyncEngine:
     def __init__(self, config, logger, worker_count: int = 4):
         self.config = config
         self.log = logger
-        self.cloud = CloudProbe(getattr(config, "cloud_probe_timeout", 5))
+        self.cloud = CloudProbe(
+            getattr(config, "cloud_probe_timeout", 5),
+            getattr(config, "cloud_hydrate_timeout", 30),
+        )
         self.cooldown = Cooldown(config.cooldown_seconds, config.big_file_cooldown, config.big_file_threshold)
         self.worker_count = worker_count
         self.pending: asyncio.Queue[str] = asyncio.Queue()
@@ -139,6 +142,7 @@ class SyncEngine:
         self.in_flight: set[str] = set()
         self.dirty: set[str] = set()
         self.parked: set[str] = set()
+        self._hydrate_attempts: dict[str, int] = {}
         self._retry_handles: dict[str, asyncio.TimerHandle] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.status = StatusReporter(getattr(config, "logs_dir", None))
@@ -195,7 +199,7 @@ class SyncEngine:
         self.queued.add(rel_path)
         self.pending.put_nowait(rel_path)
 
-    def _schedule_retry(self, rel_path: str, delay: float):
+    def _schedule_retry(self, rel_path: str, delay: float, wake_parked: bool = False):
         """Coalesces delayed retries without losing the earliest wake-up.
 
         A retry re-enters the normal queue, so the same per-path serialization
@@ -211,7 +215,7 @@ class SyncEngine:
 
         def wake():
             self._retry_handles.pop(rel_path, None)
-            self.enqueue(rel_path)
+            self.enqueue(rel_path, wake_parked)
 
         self._retry_handles[rel_path] = loop.call_at(target, wake)
 
@@ -219,6 +223,20 @@ class SyncEngine:
         handle = self._retry_handles.pop(rel_path, None)
         if handle:
             handle.cancel()
+
+    def _park_for_retry(self, rel_path: str) -> float:
+        attempt = self._hydrate_attempts.get(rel_path, 0) + 1
+        self._hydrate_attempts[rel_path] = attempt
+        initial = getattr(self.config, "hydrate_retry_initial", 15)
+        maximum = getattr(self.config, "hydrate_retry_max", 300)
+        delay = min(initial * (2 ** min(attempt - 1, 20)), maximum)
+        self.parked.add(rel_path)
+        self._schedule_retry(rel_path, delay, wake_parked=True)
+        return delay
+
+    def _hydration_succeeded(self, rel_path: str):
+        self.parked.discard(rel_path)
+        self._hydrate_attempts.pop(rel_path, None)
 
     def _on_fs_event(self, abs_path: str, root: str):
         rel = self._relativize(abs_path, root)
@@ -302,17 +320,27 @@ class SyncEngine:
             try:
                 cloud_available = await self.cloud.is_content_available(cloud)
             except CloudProbeTimeout as exc:
-                self.parked.add(rel_path)
-                self.log.error("TIMEOUT", f"{rel_path} — {exc}; parked until the file changes", level="important")
+                delay = self._park_for_retry(rel_path)
+                self.log.error("TIMEOUT", f"{rel_path} — {exc}; retrying in {delay:.0f}s", level="important")
                 return "PROBE_TIMEOUT"
             except CloudProbeError as exc:
-                self.parked.add(rel_path)
-                self.log.error("PROBE", f"{rel_path} — {exc}; parked until the file changes", level="important")
+                delay = self._park_for_retry(rel_path)
+                self.log.error("PROBE", f"{rel_path} — {exc}; retrying in {delay:.0f}s", level="important")
                 return "PROBE_ERROR"
             if not cloud_available:
-                self.parked.add(rel_path)
-                self.log.info("PARK", f"{rel_path} — cloud content is offline; waiting for a filesystem change", level="verbose")
-                return "PARK"
+                try:
+                    cloud_available = await self.cloud.hydrate(cloud)
+                except (CloudProbeTimeout, CloudProbeError) as exc:
+                    cloud_available = False
+                    self.log.warn("HYDRATE", f"{rel_path} — {exc}", level="verbose")
+                if not cloud_available:
+                    delay = self._park_for_retry(rel_path)
+                    self.log.info("PARK", f"{rel_path} — cloud content is offline; retrying in {delay:.0f}s", level="verbose")
+                    return "PARK"
+                self.log.info("HYDRATE", f"{rel_path} — downloaded from cloud", level="verbose")
+            self._hydration_succeeded(rel_path)
+        else:
+            self._hydration_succeeded(rel_path)
 
         if not local_exists and not cloud_exists:
             if baseline_exists:

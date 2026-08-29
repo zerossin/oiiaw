@@ -26,6 +26,8 @@ FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 CF_PLACEHOLDER_INFO_STANDARD = 1
+CF_HYDRATE_FLAG_NONE = 0
+CF_EOF = -1
 
 
 class PinState(Enum):
@@ -95,6 +97,14 @@ def _load_cldapi():
         ctypes.POINTER(ctypes.c_uint32),
     ]
     cldapi.CfGetPlaceholderInfo.restype = ctypes.c_long
+    cldapi.CfHydratePlaceholder.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    cldapi.CfHydratePlaceholder.restype = ctypes.c_long
     return k32, cldapi
 
 
@@ -165,6 +175,35 @@ class CloudFilter:
             return False
         return info.on_disk_bytes >= full_size
 
+    def hydrate(self, path: str) -> bool:
+        """Ask the sync provider to make the complete file available locally."""
+        if not self._available:
+            return False
+
+        handle = self._k32.CreateFileW(
+            str(path),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ_WRITE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if handle is None or handle == INVALID_HANDLE_VALUE:
+            return False
+
+        try:
+            result = self._cldapi.CfHydratePlaceholder(
+                handle,
+                0,
+                CF_EOF,
+                CF_HYDRATE_FLAG_NONE,
+                None,
+            )
+        finally:
+            self._k32.CloseHandle(handle)
+        return result == 0 and self.is_content_available(path)
+
 
 def _probe_worker(connection):
     """Runs unsafe provider calls outside the sync process's event loop.
@@ -177,13 +216,20 @@ def _probe_worker(connection):
     try:
         while True:
             try:
-                path = connection.recv()
+                request = connection.recv()
             except EOFError:
                 return
-            if path is None:
+            if request is None:
                 return
             try:
-                connection.send(("ok", cloud_filter.is_content_available(path)))
+                action, path = request
+                if action == "available":
+                    result = cloud_filter.is_content_available(path)
+                elif action == "hydrate":
+                    result = cloud_filter.hydrate(path)
+                else:
+                    raise ValueError(f"unknown cloud probe action: {action}")
+                connection.send(("ok", result))
             except BaseException as exc:
                 connection.send(("error", f"{type(exc).__name__}: {exc}"))
     finally:
@@ -193,8 +239,9 @@ def _probe_worker(connection):
 class CloudProbe:
     """Async facade over one disposable cloud-status helper process."""
 
-    def __init__(self, timeout_seconds: float = 5.0, context=None):
+    def __init__(self, timeout_seconds: float = 5.0, hydrate_timeout_seconds: float = 30.0, context=None):
         self.timeout_seconds = timeout_seconds
+        self.hydrate_timeout_seconds = hydrate_timeout_seconds
         self._context = context or multiprocessing.get_context("spawn")
         self._connection = None
         self._process = None
@@ -230,13 +277,13 @@ class CloudProbe:
                 process.kill()
                 process.join(timeout=0.2)
 
-    async def is_content_available(self, path: str) -> bool:
+    async def _request(self, action: str, path: str, timeout_seconds: float) -> bool:
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
             self._ensure_worker()
             try:
-                self._connection.send(str(path))
+                self._connection.send((action, str(path)))
             except (BrokenPipeError, EOFError, OSError) as exc:
                 self._discard_worker()
                 raise CloudProbeError(f"could not contact cloud probe: {exc}") from exc
@@ -244,10 +291,10 @@ class CloudProbe:
             # Pipe polling has its own hard timeout and wakes immediately on a
             # response. Running only that bounded wait in a thread avoids both
             # event-loop blocking and a 50 ms polling tax for every vault file.
-            ready = await asyncio.to_thread(self._connection.poll, self.timeout_seconds)
+            ready = await asyncio.to_thread(self._connection.poll, timeout_seconds)
             if not ready:
                 self._discard_worker()
-                raise CloudProbeTimeout(f"cloud probe exceeded {self.timeout_seconds:.1f}s")
+                raise CloudProbeTimeout(f"cloud {action} exceeded {timeout_seconds:.1f}s")
             try:
                 kind, payload = self._connection.recv()
             except (EOFError, OSError) as exc:
@@ -256,6 +303,12 @@ class CloudProbe:
             if kind == "ok":
                 return bool(payload)
             raise CloudProbeError(str(payload))
+
+    async def is_content_available(self, path: str) -> bool:
+        return await self._request("available", path, self.timeout_seconds)
+
+    async def hydrate(self, path: str) -> bool:
+        return await self._request("hydrate", path, self.hydrate_timeout_seconds)
 
     def close(self):
         self._discard_worker()
