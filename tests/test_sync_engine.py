@@ -277,11 +277,18 @@ def test_cloud_probe_failure_is_parked_without_blocking(engine, monkeypatch, exc
 
     monkeypatch.setattr(engine.cloud, "is_content_available", fail)
 
-    event = asyncio.run(engine.sync_one("offline.md"))
+    async def scenario():
+        engine.loop = asyncio.get_running_loop()
+        try:
+            event = await engine.sync_one("offline.md")
 
-    assert event == event_type
-    assert "offline.md" in engine.parked
-    assert "offline.md" in engine._retry_handles
+            assert event == event_type
+            assert "offline.md" in engine.parked
+            assert "offline.md" in engine._retry_handles
+        finally:
+            engine._cancel_retry("offline.md")
+
+    asyncio.run(scenario())
 
 
 def test_events_during_sync_are_coalesced_not_run_concurrently(engine):
