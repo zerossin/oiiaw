@@ -30,6 +30,8 @@ def make_config(tmp_path):
         cloud_hydrate_timeout=0.02,
         hydrate_retry_initial=0.01,
         hydrate_retry_max=0.02,
+        error_retry_initial=0.01,
+        error_retry_max=0.02,
         cooldown_seconds=0.01,
         big_file_threshold=102400,
         big_file_cooldown=0.01,
@@ -227,6 +229,22 @@ def test_failed_hydration_is_automatically_retried(engine, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_success_after_cloud_retry_clears_red_error_state(engine):
+    rel_path = "offline.md"
+    content = "content is now available"
+    for root in (engine.config.local_vault, engine.config.cloud_vault, engine.config.sync_baseline):
+        with open(os.path.join(root, rel_path), "w") as f:
+            f.write(content)
+    engine.parked.add(rel_path)
+    engine._hydrate_attempts[rel_path] = 2
+    engine.status.record_event("PROBE_TIMEOUT", rel_path)
+
+    asyncio.run(engine.sync_one(rel_path))
+
+    assert engine.status.last_event["type"] == "RECOVERED"
+    assert rel_path not in engine.parked
+
+
 @pytest.mark.parametrize(
     ("exception", "event_type"),
     [
@@ -284,6 +302,68 @@ def test_events_during_sync_are_coalesced_not_run_concurrently(engine):
                 await asyncio.sleep(0.01)
             assert calls == 2
             assert max_running == 1
+        finally:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+    asyncio.run(scenario())
+
+
+def test_unexpected_file_error_is_automatically_retried(engine):
+    async def scenario():
+        engine.loop = asyncio.get_running_loop()
+        calls = 0
+
+        async def fail_once(rel_path):
+            nonlocal calls
+            calls += 1
+            raise PermissionError("temporarily locked")
+
+        engine.sync_one = fail_once
+        worker = asyncio.create_task(engine._worker())
+        try:
+            engine.enqueue("locked.md")
+            await engine.pending.join()
+
+            assert "locked.md" in engine._retry_handles
+            assert engine.status.error_count == 1
+
+            for _ in range(50):
+                if calls >= 2:
+                    break
+                await asyncio.sleep(0.002)
+            assert calls >= 2
+        finally:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+    asyncio.run(scenario())
+
+
+def test_success_after_file_error_clears_error_state(engine):
+    async def scenario():
+        engine.loop = asyncio.get_running_loop()
+        calls = 0
+
+        async def fail_then_recover(rel_path):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise PermissionError("temporarily locked")
+
+        engine.sync_one = fail_then_recover
+        worker = asyncio.create_task(engine._worker())
+        try:
+            engine.enqueue("locked.md")
+            for _ in range(50):
+                if engine.status.last_event and engine.status.last_event["type"] == "RECOVERED":
+                    break
+                await asyncio.sleep(0.002)
+
+            assert engine.status.last_event["type"] == "RECOVERED"
+            assert "locked.md" not in engine._error_attempts
         finally:
             worker.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -357,3 +437,16 @@ def test_ignore_patterns_excludes_matching_paths(tmp_path):
 
 def test_internal_atomic_copy_file_is_not_tracked(engine):
     assert engine.is_tracked("notes/note.md.oiiaw-tmp") is False
+
+
+def test_missing_cloud_root_is_not_mistaken_for_remote_deletion(engine):
+    local = os.path.join(engine.config.local_vault, "note.md")
+    with open(local, "w") as f:
+        f.write("must remain local while iCloud is unavailable")
+    os.rmdir(engine.config.cloud_vault)
+
+    with pytest.raises(FileNotFoundError, match="iCloud 폴더"):
+        asyncio.run(engine.sync_one("note.md"))
+
+    assert os.path.isfile(local)
+    assert not os.path.exists(os.path.join(engine.config.local_vault, ".trash", "note.md"))

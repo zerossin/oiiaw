@@ -12,6 +12,16 @@ from .paths import default_config_path
 from .ui_assets import apply_window_icon, configure_windows_app_identity
 
 
+def _show_error(message: str):
+    import tkinter as tk
+    from tkinter import messagebox
+    root = tk.Tk()
+    apply_window_icon(root)
+    root.withdraw()
+    messagebox.showerror("oiiaw", message)
+    root.destroy()
+
+
 def _run(config_path):
     configure_windows_app_identity()
     config = Config.load(config_path)
@@ -21,22 +31,24 @@ def _run(config_path):
     if StatusReporter.is_fresh(existing, max_age=5.0):
         message = f"oiiaw가 이미 실행 중입니다 (pid {existing['pid']}) — 중복 실행을 막기 위해 새로 시작하지 않습니다."
         logger.error("START", message, level="important")
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk()
-        apply_window_icon(root)
-        root.withdraw()
-        messagebox.showerror("oiiaw", message)
-        root.destroy()
+        _show_error(message)
         sys.exit(1)
 
-    for problem in config.validate():
+    problems = config.validate()
+    blocking = [problem for problem in problems if problem.blocking]
+    for problem in problems:
         if problem.blocking:
             logger.error("CONFIG", problem.message, level="important")
-            sys.exit(1)
+            continue
         logger.warn("CONFIG", problem.message, level="important")
+    if blocking:
+        details = "\n".join(f"• {problem.message}" for problem in blocking)
+        _show_error(f"설정을 확인해주세요.\n\n{details}\n\n`oiiaw-setup`에서 폴더를 다시 선택할 수 있습니다.")
+        sys.exit(1)
 
-    for path in (config.local_vault, config.cloud_vault, config.sync_baseline, config.logs_dir):
+    # Never create the cloud path ourselves: a typo or a temporarily missing
+    # iCloud mount must not be mistaken for a healthy, synced directory.
+    for path in (config.local_vault, config.sync_baseline, config.logs_dir):
         if path:
             os.makedirs(path, exist_ok=True)
 

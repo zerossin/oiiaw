@@ -8,10 +8,12 @@ from two instances racing.
 
 import os
 import json
+import threading
 import time
 import types
 
 from oiiaw.tray import StatusWindow, TrayApp
+from oiiaw.status_file import StatusReporter
 
 
 def test_relaunch_clears_stale_heartbeat_before_starting_new_process(tmp_path, monkeypatch):
@@ -52,3 +54,41 @@ def test_stale_heartbeat_uses_error_icon():
 
     assert app._icon_state(stale) == "error"
     assert app._tooltip(stale) == "oiiaw — 동기화 엔진 응답 없음"
+
+
+def test_engine_is_rebuilt_after_unexpected_exit(monkeypatch):
+    stop = threading.Event()
+    errors = []
+
+    class Logger:
+        def error(self, tag, message, level="normal"):
+            errors.append((tag, message))
+
+    class CrashedEngine:
+        def __init__(self):
+            self.status = StatusReporter(None)
+
+        async def run(self):
+            raise RuntimeError("watcher failed")
+
+    class RecoveredEngine:
+        def __init__(self, config, logger):
+            self.status = StatusReporter(None)
+
+        async def run(self):
+            stop.set()
+
+    app = TrayApp.__new__(TrayApp)
+    app.config = types.SimpleNamespace()
+    app.log = Logger()
+    app.engine = CrashedEngine()
+    app._stop = stop
+
+    monkeypatch.setattr("oiiaw.tray.SyncEngine", RecoveredEngine)
+    monkeypatch.setattr("oiiaw.tray._ENGINE_RETRY_INITIAL", 0.001)
+    monkeypatch.setattr("oiiaw.tray._ENGINE_RETRY_MAX", 0.001)
+
+    app._run_engine()
+
+    assert isinstance(app.engine, RecoveredEngine)
+    assert errors and errors[0][0] == "ENGINE"

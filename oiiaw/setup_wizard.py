@@ -6,13 +6,14 @@ itself) is placed under AppData automatically. No YAML editing, no command
 line beyond launching this wizard once.
 """
 
+import hashlib
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import yaml
 
-from .config import discover_icloud_vault
+from .config import discover_icloud_vault, paths_overlap
 from .paths import app_data_dir, default_config_path
 from .ui_assets import apply_window_icon, configure_windows_app_identity
 from . import autostart
@@ -24,11 +25,16 @@ def default_local_vault() -> str:
 
 def build_config(local_vault: str, cloud_vault: str) -> dict:
     data_dir = app_data_dir()
+    identity = "\0".join(
+        os.path.normcase(os.path.abspath(path))
+        for path in (local_vault, cloud_vault)
+    )
+    vault_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
     return {
         "paths": {
             "local_vault": local_vault,
             "cloud_vault": cloud_vault,
-            "sync_baseline": os.path.join(data_dir, "baseline"),
+            "sync_baseline": os.path.join(data_dir, "baselines", vault_id),
             "logs_dir": os.path.join(data_dir, "logs"),
         },
         "ignore": {
@@ -100,8 +106,15 @@ class SetupWizard(tk.Tk):
         if not local_vault or not cloud_vault:
             messagebox.showerror("oiiaw", "두 폴더 모두 선택해주세요.")
             return
-        if os.path.normcase(local_vault) == os.path.normcase(cloud_vault):
-            messagebox.showerror("oiiaw", "로컬 폴더와 iCloud 폴더는 서로 달라야 합니다.")
+        if paths_overlap(local_vault, cloud_vault):
+            messagebox.showerror("oiiaw", "로컬 폴더와 iCloud 폴더는 서로 포함되지 않은 별도 폴더여야 합니다.")
+            return
+        if not os.path.isdir(cloud_vault):
+            messagebox.showerror(
+                "oiiaw",
+                "선택한 iCloud 폴더를 찾을 수 없습니다.\n"
+                "iCloud Drive가 실행 중인지 확인한 뒤 기존 폴더를 다시 선택해주세요.",
+            )
             return
 
         os.makedirs(local_vault, exist_ok=True)

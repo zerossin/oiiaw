@@ -143,6 +143,7 @@ class SyncEngine:
         self.dirty: set[str] = set()
         self.parked: set[str] = set()
         self._hydrate_attempts: dict[str, int] = {}
+        self._error_attempts: dict[str, int] = {}
         self._retry_handles: dict[str, asyncio.TimerHandle] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.status = StatusReporter(getattr(config, "logs_dir", None))
@@ -234,9 +235,21 @@ class SyncEngine:
         self._schedule_retry(rel_path, delay, wake_parked=True)
         return delay
 
-    def _hydration_succeeded(self, rel_path: str):
+    def _hydration_succeeded(self, rel_path: str) -> bool:
+        was_retrying = rel_path in self.parked or rel_path in self._hydrate_attempts
         self.parked.discard(rel_path)
         self._hydrate_attempts.pop(rel_path, None)
+        return was_retrying
+
+    def _retry_after_error(self, rel_path: str) -> float:
+        """Retry unexpected per-file failures without stalling other files."""
+        attempt = self._error_attempts.get(rel_path, 0) + 1
+        self._error_attempts[rel_path] = attempt
+        initial = getattr(self.config, "error_retry_initial", 5)
+        maximum = getattr(self.config, "error_retry_max", 300)
+        delay = min(initial * (2 ** min(attempt - 1, 20)), maximum)
+        self._schedule_retry(rel_path, delay, wake_parked=True)
+        return delay
 
     def _on_fs_event(self, abs_path: str, root: str):
         rel = self._relativize(abs_path, root)
@@ -265,11 +278,17 @@ class SyncEngine:
             self.in_flight.add(rel_path)
             self.active += 1
             try:
+                was_retrying = rel_path in self._error_attempts
                 event = await self.sync_one(rel_path)
+                self._error_attempts.pop(rel_path, None)
                 if event:
                     self.status.record_event(event, rel_path)
+                elif was_retrying:
+                    self.log.success("RECOVERED", rel_path, level="verbose")
+                    self.status.record_event("RECOVERED", rel_path)
             except Exception as e:
-                self.log.error("ERROR", f"{rel_path}: {e}")
+                delay = self._retry_after_error(rel_path)
+                self.log.error("ERROR", f"{rel_path}: {e}; retrying in {delay:.0f}s")
                 self.status.record_event("ERROR", rel_path)
             finally:
                 self.active -= 1
@@ -305,6 +324,10 @@ class SyncEngine:
 
     async def sync_one(self, rel_path: str):
         config = self.config
+        # A missing iCloud mount is not the same as every cloud file being
+        # deleted. Refuse all decisions until the root comes back.
+        if not os.path.isdir(config.cloud_vault):
+            raise FileNotFoundError(f"iCloud 폴더를 기다리는 중: {config.cloud_vault}")
         blocked_for = self.cooldown.remaining(rel_path)
         if blocked_for > 0:
             self._schedule_retry(rel_path, blocked_for)
@@ -338,7 +361,9 @@ class SyncEngine:
                     self.log.info("PARK", f"{rel_path} — cloud content is offline; retrying in {delay:.0f}s", level="verbose")
                     return "PARK"
                 self.log.info("HYDRATE", f"{rel_path} — downloaded from cloud", level="verbose")
-            self._hydration_succeeded(rel_path)
+            if self._hydration_succeeded(rel_path):
+                self.log.success("RECOVERED", f"{rel_path} — iCloud file is available", level="verbose")
+                self.status.record_event("RECOVERED", rel_path)
         else:
             self._hydration_succeeded(rel_path)
 
@@ -441,12 +466,16 @@ class SyncEngine:
     async def run(self):
         self.log.init_log_file()
         self.loop = asyncio.get_running_loop()
+        if not os.path.isdir(self.config.cloud_vault):
+            raise FileNotFoundError(f"iCloud 폴더를 기다리는 중: {self.config.cloud_vault}")
         observer = self.start_watching()
         workers = [asyncio.create_task(self._worker()) for _ in range(self.worker_count)]
         try:
             for rel in self.discover_tracked_paths():
                 self.enqueue(rel)
             while not self._shutdown_event.is_set():
+                if not os.path.isdir(self.config.cloud_vault):
+                    raise FileNotFoundError(f"iCloud 폴더 연결이 끊김: {self.config.cloud_vault}")
                 state = "syncing" if self.active > 0 or not self.pending.empty() else "idle"
                 self.status.write(state, self.pending.qsize(), len(self.parked))
                 self.log.flush()

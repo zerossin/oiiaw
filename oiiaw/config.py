@@ -11,6 +11,17 @@ def discover_icloud_vault() -> str | None:
     return candidates[0] if candidates else None
 
 
+def paths_overlap(first: str, second: str) -> bool:
+    """True when either configured vault contains the other."""
+    try:
+        first = os.path.normcase(os.path.abspath(first))
+        second = os.path.normcase(os.path.abspath(second))
+        common = os.path.normcase(os.path.commonpath((first, second)))
+    except ValueError:
+        return False
+    return common in (first, second)
+
+
 @dataclass(frozen=True)
 class ConfigProblem:
     message: str
@@ -33,6 +44,8 @@ class Config:
         self.cloud_hydrate_timeout = sync.get("cloud_hydrate_timeout", 30)
         self.hydrate_retry_initial = sync.get("hydrate_retry_initial", 15)
         self.hydrate_retry_max = sync.get("hydrate_retry_max", 300)
+        self.error_retry_initial = sync.get("error_retry_initial", 5)
+        self.error_retry_max = sync.get("error_retry_max", 300)
         self.big_file_threshold = sync.get("big_file_threshold", 102400)
         self.big_file_cooldown = sync.get("big_file_cooldown", 30)
         logging_cfg = data.get("logging", {})
@@ -56,9 +69,10 @@ class Config:
             problems.append(ConfigProblem("paths.local_vault is not set", blocking=True))
         if not self.cloud_vault:
             problems.append(ConfigProblem("paths.cloud_vault is not set and could not be auto-discovered", blocking=True))
-        if self.local_vault and self.cloud_vault and os.path.normcase(self.local_vault) == os.path.normcase(self.cloud_vault):
-            problems.append(ConfigProblem("local_vault and cloud_vault must not be the same folder", blocking=True))
-        for name, value in (("local_vault", self.local_vault), ("cloud_vault", self.cloud_vault)):
-            if value and not os.path.isdir(value):
-                problems.append(ConfigProblem(f"{name} does not exist yet: {value}", blocking=False))
+        if self.local_vault and self.cloud_vault and paths_overlap(self.local_vault, self.cloud_vault):
+            problems.append(ConfigProblem("local_vault and cloud_vault must not contain each other", blocking=True))
+        if self.local_vault and not os.path.isdir(self.local_vault):
+            problems.append(ConfigProblem(f"local_vault does not exist yet: {self.local_vault}", blocking=False))
+        if self.cloud_vault and not os.path.isdir(self.cloud_vault):
+            problems.append(ConfigProblem(f"cloud_vault is temporarily unavailable: {self.cloud_vault}", blocking=False))
         return problems

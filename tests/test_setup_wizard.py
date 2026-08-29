@@ -24,3 +24,12 @@ def test_build_config_ignore_defaults_match_example_yaml():
     assert generated["dirs"] == example["ignore"]["dirs"]
     assert generated["files"] == example["ignore"]["files"]
     assert generated["patterns"] == example["ignore"]["patterns"]
+
+
+def test_build_config_uses_a_stable_baseline_per_vault_pair():
+    first = build_config(r"C:\local", r"C:\cloud")["paths"]["sync_baseline"]
+    same = build_config(r"C:\local", r"C:\cloud")["paths"]["sync_baseline"]
+    changed = build_config(r"C:\other", r"C:\cloud")["paths"]["sync_baseline"]
+
+    assert first == same
+    assert first != changed

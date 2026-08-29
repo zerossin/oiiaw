@@ -15,6 +15,7 @@ import tkinter as tk
 import pystray
 
 from . import autostart
+from .sync_engine import SyncEngine
 from .status_file import StatusReporter
 from .ui_assets import apply_window_icon, configure_windows_app_identity, tray_icon
 
@@ -26,6 +27,8 @@ _COLORS = {
 }
 
 _REFRESH_SECONDS = 2
+_ENGINE_RETRY_INITIAL = 2
+_ENGINE_RETRY_MAX = 60
 
 
 class StatusWindow:
@@ -37,7 +40,19 @@ class StatusWindow:
     status.json itself on a timer rather than being pushed to, matching
     how everything else here already works."""
 
-    _STATE_KR = {"idle": "대기 중", "syncing": "동기화 중"}
+    _STATE_KR = {"idle": "대기 중", "syncing": "동기화 중", "error": "자동 복구 중"}
+    _EVENT_KR = {
+        "PUSH": "iCloud로 보냄",
+        "PULL": "iCloud에서 받음",
+        "DELETE": "삭제 반영",
+        "CONFLICT": "충돌본 보관",
+        "RESOLVED": "충돌 자동 해소",
+        "RECOVERED": "자동 복구 완료",
+        "PARK": "iCloud 다운로드 대기",
+        "PROBE_TIMEOUT": "iCloud 확인 재시도",
+        "PROBE_ERROR": "iCloud 확인 재시도",
+        "ERROR": "오류 자동 재시도",
+    }
 
     def __init__(self, config):
         self.config = config
@@ -119,7 +134,7 @@ class StatusWindow:
         uptime_min = int((time.time() - status["started_at"]) // 60)
         summary = f"상태: {state_kr}  ·  대기 {status['pending']}개  ·  {uptime_min}분째 실행 중"
         if status.get("parked"):
-            summary += f"  ·  오프라인 보류 {status['parked']}개"
+            summary += f"  ·  iCloud 다운로드 재시도 {status['parked']}개"
         if status.get("conflict_count"):
             summary += f"  ·  충돌 {status['conflict_count']}건"
         self.state_label.config(text=summary, fg="#000000")
@@ -129,7 +144,8 @@ class StatusWindow:
         history = status.get("history") or []
         for event in reversed(history):
             stamp = time.strftime("%H:%M:%S", time.localtime(event["time"]))
-            self.history_list.insert(tk.END, f"{stamp}  {event['type']:<9} {event['path']}")
+            event_name = self._EVENT_KR.get(event["type"], event["type"])
+            self.history_list.insert(tk.END, f"{stamp}  {event_name:<14} {event['path']}")
         if not history:
             self.history_list.insert(tk.END, "(아직 활동 없음)")
 
@@ -159,12 +175,14 @@ class TrayApp:
             return "oiiaw — 시작 중..."
         if not StatusReporter.is_fresh(status):
             return "oiiaw — 동기화 엔진 응답 없음"
-        lines = [f"oiiaw — {status['state']}"]
+        state_name = StatusWindow._STATE_KR.get(status["state"], status["state"])
+        lines = [f"oiiaw — {state_name}"]
         if status.get("parked"):
-            lines.append(f"오프라인 보류 {status['parked']}개")
+            lines.append(f"iCloud 다운로드 재시도 {status['parked']}개")
         last = status.get("last_event")
         if last:
-            lines.append(f"최근: {last['type']} {last['path']}")
+            event_name = StatusWindow._EVENT_KR.get(last["type"], last["type"])
+            lines.append(f"최근: {event_name} {last['path']}")
         if status.get("conflict_count"):
             lines.append(f"충돌 {status['conflict_count']}건 (이번 세션)")
         return "\n".join(lines)
@@ -214,8 +232,33 @@ class TrayApp:
             pass
         autostart.start_now()
 
+    def _run_engine(self):
+        """Rebuild and retry an engine that exits unexpectedly."""
+        delay = _ENGINE_RETRY_INITIAL
+        while not self._stop.is_set():
+            failure = None
+            try:
+                asyncio.run(self.engine.run())
+            except Exception as exc:
+                failure = exc
+
+            if self._stop.is_set():
+                return
+
+            message = str(failure) if failure else "동기화 엔진이 예기치 않게 종료됨"
+            self.log.error("ENGINE", f"{message}; {delay:.0f}초 후 자동 재시작", level="important")
+            self.engine.status.record_event("ERROR", message)
+            self.engine.status.write("error", 0, 0)
+
+            if self._stop.wait(delay):
+                return
+            # A fresh instance also gets a fresh asyncio loop, file watcher,
+            # and cloud helper instead of reusing partially-failed state.
+            self.engine = SyncEngine(self.config, self.log)
+            delay = min(delay * 2, _ENGINE_RETRY_MAX)
+
     def run(self):
-        engine_thread = threading.Thread(target=lambda: asyncio.run(self.engine.run()), daemon=True)
+        engine_thread = threading.Thread(target=self._run_engine, daemon=True)
         engine_thread.start()
         threading.Thread(target=self._refresh_loop, daemon=True).start()
         window_thread = threading.Thread(target=self._status_window.run, daemon=True)

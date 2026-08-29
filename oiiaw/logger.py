@@ -22,6 +22,8 @@ class Logger:
         self._log_file = None
 
     def init_log_file(self):
+        if self._log_file:
+            return
         os.makedirs(self.logs_dir, exist_ok=True)
         stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         path = os.path.join(self.logs_dir, f"oiiaw_{stamp}.log")
