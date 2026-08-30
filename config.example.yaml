@@ -17,6 +17,11 @@ sync:
   hydrate_retry_max: 300
   error_retry_initial: 5
   error_retry_max: 300
+  cloud_confirm_retry: 5
+  delete_grace_seconds: 30
+  delete_batch_limit: 20
+  delete_batch_window: 60
+  protect_nonempty_from_zero: true
   big_file_threshold: 102400
   big_file_cooldown: 30
 

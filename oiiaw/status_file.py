@@ -36,7 +36,15 @@ class StatusReporter:
         self._history.append(self.last_event)
         if event_type == "CONFLICT":
             self.conflict_count += 1
-        elif event_type in ("ERROR", "PROBE_TIMEOUT", "PROBE_ERROR"):
+        elif event_type in (
+            "ERROR",
+            "PROBE_TIMEOUT",
+            "PROBE_ERROR",
+            "BLOCK_ZERO",
+            "BASELINE_HELD",
+            "DELETE_FUSE",
+            "TOMBSTONE_CONFLICT",
+        ):
             self.error_count += 1
 
     def write(self, state: str, pending: int, parked: int = 0) -> bool:

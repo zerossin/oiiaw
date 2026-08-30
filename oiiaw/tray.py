@@ -71,6 +71,13 @@ class StatusWindow:
         "PUSH": "iCloud로 보냄",
         "PULL": "iCloud에서 받음",
         "DELETE": "삭제 반영",
+        "DELETE_WAIT": "삭제 확인 대기",
+        "DELETE_FUSE": "대량 삭제 차단",
+        "DELETE_REPLAY": "삭제 파일 재등장 차단",
+        "BLOCK_ZERO": "빈 파일 덮어쓰기 차단",
+        "BASELINE_HELD": "복구 기준본 보존",
+        "PUSH_PENDING": "iCloud 확인 대기",
+        "CLOUD_WAIT": "iCloud 확정 대기",
         "CONFLICT": "충돌본 보관",
         "RESOLVED": "충돌 자동 해소",
         "RECOVERED": "자동 복구 완료",
@@ -272,7 +279,16 @@ class TrayApp:
         if not StatusReporter.is_fresh(status):
             return "error"
         last = status.get("last_event")
-        if last and last["type"] in ("CONFLICT", "ERROR", "PROBE_TIMEOUT", "PROBE_ERROR") and time.time() - last["time"] < 300:
+        if last and last["type"] in (
+            "CONFLICT",
+            "ERROR",
+            "PROBE_TIMEOUT",
+            "PROBE_ERROR",
+            "BLOCK_ZERO",
+            "BASELINE_HELD",
+            "DELETE_FUSE",
+            "TOMBSTONE_CONFLICT",
+        ) and time.time() - last["time"] < 300:
             return "conflict"
         return status.get("state", "idle")
 

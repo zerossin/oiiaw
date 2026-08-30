@@ -23,6 +23,7 @@ def make_config(tmp_path):
         local_vault=str(tmp_path / "local"),
         cloud_vault=str(tmp_path / "cloud"),
         sync_baseline=str(tmp_path / "baseline"),
+        logs_dir=str(tmp_path / "logs"),
         ignored_dirs=set(),
         ignored_files=set(),
         ignore_patterns=[],
@@ -32,6 +33,11 @@ def make_config(tmp_path):
         hydrate_retry_max=0.02,
         error_retry_initial=0.01,
         error_retry_max=0.02,
+        cloud_confirm_retry=0.01,
+        delete_grace_seconds=0,
+        delete_batch_limit=20,
+        delete_batch_window=60,
+        protect_nonempty_from_zero=True,
         cooldown_seconds=0.01,
         big_file_threshold=102400,
         big_file_cooldown=0.01,
@@ -57,7 +63,11 @@ def engine(tmp_path, monkeypatch):
     async def available(path):
         return True
 
+    async def confirmed(path):
+        return True
+
     monkeypatch.setattr(eng.cloud, "is_content_available", available)
+    monkeypatch.setattr(eng.cloud, "is_content_in_sync", confirmed)
     return eng
 
 
@@ -138,8 +148,9 @@ def test_empty_new_file_pushes(engine):
 
     event = asyncio.run(engine.sync_one("empty.md"))
 
-    assert event == "PUSH"
-    for root in (engine.config.local_vault, engine.config.cloud_vault, engine.config.sync_baseline):
+    assert event == "PUSH_PENDING"
+    assert not os.path.exists(os.path.join(engine.config.sync_baseline, "empty.md"))
+    for root in (engine.config.local_vault, engine.config.cloud_vault):
         path = os.path.join(root, "empty.md")
         assert os.path.isfile(path)
         assert os.path.getsize(path) == 0
@@ -416,6 +427,8 @@ def test_renaming_an_empty_note_syncs_the_new_title(engine):
 
     async def sync_rename():
         await asyncio.gather(engine.sync_one(old_rel), engine.sync_one(new_rel))
+        await asyncio.sleep(0.02)
+        await engine.sync_one(new_rel)
 
     asyncio.run(sync_rename())
 
@@ -446,6 +459,150 @@ def test_delete_moves_to_trash_instead_of_removing(engine):
     assert os.path.exists(trashed)
     with open(trashed) as f:
         assert f.read() == content
+
+
+def test_directory_placeholder_is_never_processed_as_a_file(engine):
+    rel = os.path.join("folder", "placeholder")
+    cloud_dir = os.path.join(engine.config.cloud_vault, rel)
+    baseline_dir = os.path.join(engine.config.sync_baseline, rel)
+    os.makedirs(cloud_dir)
+    os.makedirs(baseline_dir)
+
+    event = asyncio.run(engine.sync_one(rel))
+
+    assert event is None
+    assert os.path.isdir(cloud_dir)
+    assert os.path.isdir(baseline_dir)
+    assert not os.path.exists(os.path.join(engine.config.cloud_vault, ".trash", rel))
+
+
+def test_zero_byte_local_regression_never_overwrites_good_cloud(engine):
+    local = os.path.join(engine.config.local_vault, "note.md")
+    cloud = os.path.join(engine.config.cloud_vault, "note.md")
+    baseline = os.path.join(engine.config.sync_baseline, "note.md")
+    good = "important non-empty content"
+    for path in (local, cloud, baseline):
+        with open(path, "w") as f:
+            f.write(good)
+    open(local, "wb").close()
+
+    event = asyncio.run(engine.sync_one("note.md"))
+
+    assert event == "BLOCK_ZERO"
+    assert open(cloud).read() == good
+    assert open(baseline).read() == good
+
+
+def test_zero_byte_cloud_regression_never_overwrites_good_local(engine):
+    local = os.path.join(engine.config.local_vault, "note.md")
+    cloud = os.path.join(engine.config.cloud_vault, "note.md")
+    baseline = os.path.join(engine.config.sync_baseline, "note.md")
+    good = "important non-empty content"
+    for path in (local, cloud, baseline):
+        with open(path, "w") as f:
+            f.write(good)
+    open(cloud, "wb").close()
+
+    event = asyncio.run(engine.sync_one("note.md"))
+
+    assert event == "BLOCK_ZERO"
+    assert open(local).read() == good
+    assert open(baseline).read() == good
+
+
+def test_zero_nonzero_disagreement_without_baseline_is_preserved(engine):
+    local = os.path.join(engine.config.local_vault, "note.md")
+    cloud = os.path.join(engine.config.cloud_vault, "note.md")
+    open(local, "wb").close()
+    with open(cloud, "w") as f:
+        f.write("remote content with no confirmed baseline")
+
+    event = asyncio.run(engine.sync_one("note.md"))
+
+    assert event == "BLOCK_ZERO"
+    assert os.path.getsize(local) == 0
+    assert open(cloud).read() == "remote content with no confirmed baseline"
+    assert not os.path.exists(os.path.join(engine.config.sync_baseline, "note.md"))
+
+
+def test_push_keeps_old_baseline_until_cloud_matches_and_is_confirmed(engine, monkeypatch):
+    local = os.path.join(engine.config.local_vault, "note.md")
+    cloud = os.path.join(engine.config.cloud_vault, "note.md")
+    baseline = os.path.join(engine.config.sync_baseline, "note.md")
+    for path in (local, cloud, baseline):
+        with open(path, "w") as f:
+            f.write("old confirmed version")
+    with open(local, "w") as f:
+        f.write("new local version that must survive")
+
+    first = asyncio.run(engine.sync_one("note.md"))
+    assert first == "PUSH_PENDING"
+    assert open(baseline).read() == "old confirmed version"
+
+    # Simulate iCloud replaying the previous server version after our copy.
+    with open(cloud, "w") as f:
+        f.write("old confirmed version")
+    engine.cooldown._until.clear()
+    second = asyncio.run(engine.sync_one("note.md"))
+    assert second == "PUSH_PENDING"
+    assert open(local).read() == "new local version that must survive"
+    assert open(baseline).read() == "old confirmed version"
+
+    engine.cooldown._until.clear()
+    third = asyncio.run(engine.sync_one("note.md"))
+    assert third == "RESOLVED"
+    assert open(baseline).read() == "new local version that must survive"
+
+
+def test_transient_zero_cloud_after_push_is_blocked_not_pulled(engine):
+    local = os.path.join(engine.config.local_vault, "note.md")
+    cloud = os.path.join(engine.config.cloud_vault, "note.md")
+    baseline = os.path.join(engine.config.sync_baseline, "note.md")
+    for path in (local, cloud, baseline):
+        with open(path, "w") as f:
+            f.write("old confirmed version")
+    with open(local, "w") as f:
+        f.write("new local version")
+
+    assert asyncio.run(engine.sync_one("note.md")) == "PUSH_PENDING"
+    open(cloud, "wb").close()
+    engine.cooldown._until.clear()
+
+    assert asyncio.run(engine.sync_one("note.md")) == "BLOCK_ZERO"
+    assert open(local).read() == "new local version"
+    assert open(baseline).read() == "old confirmed version"
+
+
+def test_deleted_file_resurrection_is_suppressed_by_tombstone(engine):
+    local = os.path.join(engine.config.local_vault, "note.md")
+    cloud = os.path.join(engine.config.cloud_vault, "note.md")
+    baseline = os.path.join(engine.config.sync_baseline, "note.md")
+    content = "confirmed content"
+    for path in (local, cloud, baseline):
+        with open(path, "w") as f:
+            f.write(content)
+    os.remove(local)
+
+    assert asyncio.run(engine.sync_one("note.md")) == "DELETE"
+    with open(cloud, "w") as f:
+        f.write(content)  # stale iCloud replay
+
+    assert asyncio.run(engine.sync_one("note.md")) == "DELETE_REPLAY"
+    assert not os.path.exists(local)
+    assert not os.path.exists(cloud)
+
+
+def test_mass_delete_fuse_stops_additional_deletions(engine):
+    engine.config.delete_batch_limit = 1
+    for name in ("one.md", "two.md"):
+        for root in (engine.config.local_vault, engine.config.cloud_vault, engine.config.sync_baseline):
+            with open(os.path.join(root, name), "w") as f:
+                f.write("confirmed content")
+        os.remove(os.path.join(engine.config.local_vault, name))
+
+    assert asyncio.run(engine.sync_one("one.md")) == "DELETE"
+    assert asyncio.run(engine.sync_one("two.md")) == "DELETE_FUSE"
+    assert os.path.exists(os.path.join(engine.config.cloud_vault, "two.md"))
 
 
 def test_ignore_patterns_excludes_matching_paths(tmp_path):

@@ -58,6 +58,23 @@ def test_genuinely_empty_file_is_available(getsize):
         assert cf.is_content_available("C:/fake/empty.md") is True
 
 
+@patch("os.path.getsize", return_value=100)
+def test_hydrated_but_unconfirmed_placeholder_is_not_in_sync(getsize):
+    cf = make_filter()
+    info = PlaceholderInfo(on_disk_bytes=100, validated_bytes=100, pin_state=PinState.PINNED, in_sync=False)
+    with patch.object(cf, "get_placeholder_info", return_value=info):
+        assert cf.is_content_available("C:/fake/uploading.md") is True
+        assert cf.is_content_in_sync("C:/fake/uploading.md") is False
+
+
+@patch("os.path.getsize", return_value=100)
+def test_validated_confirmed_placeholder_is_in_sync(getsize):
+    cf = make_filter()
+    info = PlaceholderInfo(on_disk_bytes=100, validated_bytes=100, pin_state=PinState.PINNED, in_sync=True)
+    with patch.object(cf, "get_placeholder_info", return_value=info):
+        assert cf.is_content_in_sync("C:/fake/confirmed.md") is True
+
+
 def test_hydrate_requests_the_complete_file_and_rechecks_availability():
     class FakeKernel32:
         def __init__(self):
@@ -145,6 +162,16 @@ def test_isolated_probe_returns_worker_result():
     assert connection.sent == [("available", "C:/cloud/offline.md")]
     assert connection.poll_timeouts == [0.01]
     assert process.terminated is False
+    probe.close()
+
+
+def test_isolated_in_sync_probe_uses_worker_result():
+    connection = FakeConnection(("ok", True))
+    process = FakeProcess()
+    probe = make_probe(connection, process)
+
+    assert asyncio.run(probe.is_content_in_sync("C:/cloud/note.md")) is True
+    assert connection.sent == [("in_sync", "C:/cloud/note.md")]
     probe.close()
 
 

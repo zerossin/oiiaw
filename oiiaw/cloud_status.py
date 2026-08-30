@@ -175,6 +175,28 @@ class CloudFilter:
             return False
         return info.on_disk_bytes >= full_size
 
+    def is_content_in_sync(self, path: str) -> bool:
+        """True only after the cloud provider has validated the complete file.
+
+        A hydrated placeholder is merely readable; it can still be in the
+        middle of an upload/download and temporarily expose stale or empty
+        content.  Destructive sync decisions must wait for both conditions.
+        Plain files outside a Cloud Files provider have no placeholder info
+        and are treated as immediately confirmed.
+        """
+        info = self.get_placeholder_info(path)
+        if info is None:
+            return True
+        try:
+            full_size = os.path.getsize(path)
+        except OSError:
+            return False
+        return (
+            info.in_sync
+            and info.on_disk_bytes >= full_size
+            and info.validated_bytes >= full_size
+        )
+
     def hydrate(self, path: str) -> bool:
         """Ask the sync provider to make the complete file available locally."""
         if not self._available:
@@ -225,6 +247,8 @@ def _probe_worker(connection):
                 action, path = request
                 if action == "available":
                     result = cloud_filter.is_content_available(path)
+                elif action == "in_sync":
+                    result = cloud_filter.is_content_in_sync(path)
                 elif action == "hydrate":
                     result = cloud_filter.hydrate(path)
                 else:
@@ -306,6 +330,9 @@ class CloudProbe:
 
     async def is_content_available(self, path: str) -> bool:
         return await self._request("available", path, self.timeout_seconds)
+
+    async def is_content_in_sync(self, path: str) -> bool:
+        return await self._request("in_sync", path, self.timeout_seconds)
 
     async def hydrate(self, path: str) -> bool:
         return await self._request("hydrate", path, self.hydrate_timeout_seconds)

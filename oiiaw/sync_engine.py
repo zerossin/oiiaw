@@ -16,11 +16,17 @@ and retried with bounded backoff.
 Filesystem events that arrive while the same path is being processed are
 coalesced into one follow-up pass instead of being dropped or run concurrently.
 
-New files wait `stability_window` seconds and get re-checked for size
-changes before being pushed/pulled, so a file mid-autosave doesn't get
-copied half-written. A both-sides-changed conflict waits the longer
-`stabilize_wait` before deciding — long enough for a still-active edit on
-either side to finish — then re-hashes instead of trusting stale values.
+Every changed file waits `stability_window` seconds and must keep the same
+size, mtime and hash before being pushed/pulled, so a file mid-autosave
+doesn't get copied half-written. A both-sides-changed conflict waits the
+longer `stabilize_wait` before deciding. A local push does not advance the
+baseline until iCloud reports the copied bytes as confirmed; stale provider
+echoes therefore cannot masquerade as legitimate remote edits.
+
+Destructive paths have additional interlocks: directory placeholders are
+never treated as files, non-empty baselines cannot regress to zero bytes,
+deletions wait through a grace period, a persistent tombstone suppresses
+cloud resurrection, and a rate fuse stops mass deletion batches.
 After any successful push/pull, `cooldown_seconds` (or `big_file_cooldown`
 for files over `big_file_threshold`) suppresses repeat events for that path
 so autosave-heavy apps don't re-trigger a sync cycle every keystroke.
@@ -32,6 +38,8 @@ import shutil
 import hashlib
 import fnmatch
 import asyncio
+import json
+from collections import deque
 from dataclasses import dataclass, field
 
 from watchdog.observers import Observer
@@ -42,14 +50,15 @@ from .status_file import StatusReporter
 
 
 def sha256_of(path: str) -> str | None:
-    try:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except OSError:
+    if not os.path.exists(path):
         return None
+    if not os.path.isfile(path):
+        raise IsADirectoryError(path)
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def atomic_copy(src: str, dst: str):
@@ -157,12 +166,130 @@ class SyncEngine:
         self._hydrate_attempts: dict[str, int] = {}
         self._error_attempts: dict[str, int] = {}
         self._retry_handles: dict[str, asyncio.TimerHandle] = {}
+        self._delete_candidates: dict[tuple[str, str], float] = {}
+        self._recent_deletes: deque[float] = deque()
+        self._delete_fuse_tripped = False
+        self._safety_blocks: set[str] = set()
+        self._state_path = None
+        logs_dir = getattr(config, "logs_dir", None)
+        if logs_dir:
+            self._state_path = os.path.join(logs_dir, "sync_state.json")
+        self._tombstones: dict[str, dict] = self._load_safety_state()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.status = StatusReporter(getattr(config, "logs_dir", None))
         self.active = 0
         self._shutdown_event = asyncio.Event()
 
     # ── path helpers ──
+
+    @staticmethod
+    def _state_key(rel_path: str) -> str:
+        return os.path.normcase(os.path.normpath(rel_path))
+
+    def _load_safety_state(self) -> dict[str, dict]:
+        if not self._state_path:
+            return {}
+        try:
+            with open(self._state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            tombstones = data.get("tombstones", {})
+            return tombstones if isinstance(tombstones, dict) else {}
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return {}
+
+    def _save_safety_state(self):
+        if not self._state_path:
+            return
+        os.makedirs(os.path.dirname(self._state_path), exist_ok=True)
+        tmp = self._state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"tombstones": self._tombstones}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self._state_path)
+
+    def _record_tombstone(self, rel_path: str, missing_side: str, content_hash: str):
+        self._tombstones[self._state_key(rel_path)] = {
+            "path": rel_path,
+            "missing_side": missing_side,
+            "hash": content_hash,
+            "time": time.time(),
+        }
+        self._save_safety_state()
+
+    def _clear_tombstone(self, rel_path: str):
+        if self._tombstones.pop(self._state_key(rel_path), None) is not None:
+            self._save_safety_state()
+
+    def _deletion_ready(self, rel_path: str, missing_side: str) -> bool:
+        grace = max(0.0, float(getattr(self.config, "delete_grace_seconds", 30)))
+        key = (self._state_key(rel_path), missing_side)
+        now = time.time()
+        first_seen = self._delete_candidates.setdefault(key, now)
+        remaining = grace - (now - first_seen)
+        if remaining > 0:
+            self._schedule_retry(rel_path, remaining)
+            self.log.warn(
+                "DELETE_WAIT",
+                f"{rel_path} — {missing_side} disappearance must remain stable for {remaining:.0f}s",
+                level="verbose",
+            )
+            return False
+        self._delete_candidates.pop(key, None)
+        return True
+
+    def _allow_destructive_delete(self, rel_path: str) -> bool:
+        if self._delete_fuse_tripped:
+            return False
+        now = time.time()
+        window = max(1.0, float(getattr(self.config, "delete_batch_window", 60)))
+        limit = max(1, int(getattr(self.config, "delete_batch_limit", 20)))
+        while self._recent_deletes and now - self._recent_deletes[0] > window:
+            self._recent_deletes.popleft()
+        if len(self._recent_deletes) >= limit:
+            self._delete_fuse_tripped = True
+            self.log.error(
+                "DELETE_FUSE",
+                f"blocked mass deletion at {rel_path}: {limit} deletes within {window:.0f}s",
+                level="important",
+            )
+            return False
+        self._recent_deletes.append(now)
+        return True
+
+    def _is_zero_regression(self, candidate: str, baseline: str) -> bool:
+        if not getattr(self.config, "protect_nonempty_from_zero", True):
+            return False
+        try:
+            return os.path.getsize(baseline) > 0 and os.path.getsize(candidate) == 0
+        except OSError:
+            return False
+
+    def _block_zero_regression(self, rel_path: str, side: str):
+        self._safety_blocks.add(rel_path)
+        delay = max(1.0, float(getattr(self.config, "stability_window", 3)))
+        self._schedule_retry(rel_path, delay)
+        self.log.error(
+            "BLOCK_ZERO",
+            f"{rel_path} — refused to replace a non-empty baseline with a zero-byte {side} file",
+            level="important",
+        )
+
+    async def _cloud_is_confirmed(self, rel_path: str, cloud_path: str) -> bool:
+        try:
+            confirmed = await self.cloud.is_content_in_sync(cloud_path)
+        except (CloudProbeTimeout, CloudProbeError) as exc:
+            delay = self._park_for_retry(rel_path)
+            self.log.error("PROBE", f"{rel_path} — {exc}; retrying in {delay:.0f}s", level="important")
+            return False
+        if confirmed:
+            return True
+        delay = max(1.0, float(getattr(self.config, "cloud_confirm_retry", 5)))
+        self._schedule_retry(rel_path, delay)
+        self.log.info(
+            "CLOUD_WAIT",
+            f"{rel_path} — waiting for iCloud to confirm the current bytes",
+            level="verbose",
+        )
+        return False
 
     def is_tracked(self, rel_path: str) -> bool:
         name = os.path.basename(rel_path).lower()
@@ -331,12 +458,108 @@ class SyncEngine:
             return False
         return before == after
 
+    @staticmethod
+    async def _content_settled(path: str, wait_seconds: float) -> bool:
+        """Require bytes and metadata to remain identical across the window.
+
+        Existing-file saves often truncate and rewrite in multiple steps. A
+        size-only check can accept a transient zero-byte file or two different
+        same-sized versions, so destructive copies use a full fingerprint.
+        """
+        try:
+            before_stat = os.stat(path)
+            before_hash = sha256_of(path)
+        except OSError:
+            return False
+        await asyncio.sleep(wait_seconds)
+        try:
+            after_stat = os.stat(path)
+            after_hash = sha256_of(path)
+        except OSError:
+            return False
+        return (
+            before_stat.st_size == after_stat.st_size
+            and before_stat.st_mtime_ns == after_stat.st_mtime_ns
+            and before_hash == after_hash
+        )
+
+    def _defer_unsettled(self, rel_path: str):
+        delay = max(0.01, float(getattr(self.config, "stability_window", 3)))
+        self._schedule_retry(rel_path, delay)
+        self.log.info("WAIT", f"{rel_path} not settled yet, deferring", level="verbose")
+
+    def _handle_tombstone(
+        self,
+        rel_path: str,
+        local: str,
+        cloud: str,
+        local_exists: bool,
+        cloud_exists: bool,
+    ):
+        tombstone = self._tombstones.get(self._state_key(rel_path))
+        if not tombstone:
+            return None
+
+        missing_side = tombstone.get("missing_side")
+        source_exists = local_exists if missing_side == "local" else cloud_exists
+        if source_exists:
+            # The side that initiated the deletion has intentionally restored
+            # the path. It is now a normal new/changed file again.
+            self._clear_tombstone(rel_path)
+            return None
+
+        target = cloud if missing_side == "local" else local
+        target_root = self.config.cloud_vault if missing_side == "local" else self.config.local_vault
+        target_exists = cloud_exists if missing_side == "local" else local_exists
+        if not target_exists:
+            return "TOMBSTONE"
+
+        target_hash = sha256_of(target)
+        if target_hash != tombstone.get("hash"):
+            self._safety_blocks.add(rel_path)
+            self.log.error(
+                "TOMBSTONE_CONFLICT",
+                f"{rel_path} — a different file reappeared after deletion; preserved for review",
+                level="important",
+            )
+            return "TOMBSTONE_CONFLICT"
+
+        trash_move(target_root, rel_path)
+        self.log.warn("DELETE_REPLAY", f"{rel_path} — suppressed cloud resurrection", level="verbose")
+        return "DELETE_REPLAY"
+
     def _start_cooldown(self, rel_path: str, synced_path: str):
         try:
             size = os.path.getsize(synced_path)
         except OSError:
             size = 0
         self.cooldown.start(rel_path, size)
+
+    def _push_pending_confirmation(self, rel_path: str, local: str, cloud: str):
+        """Copy local bytes out, but keep the old baseline until iCloud ACKs.
+
+        If iCloud replays a stale/empty version before confirmation, the old
+        baseline still identifies it as a cloud-side divergence instead of a
+        legitimate remote edit that may overwrite the user's local document.
+        """
+        atomic_copy(local, cloud)
+        self._start_cooldown(rel_path, local)
+        delay = max(1.0, float(getattr(self.config, "cloud_confirm_retry", 5)))
+        self._schedule_retry(rel_path, delay)
+        self.log.success("PUSH_PENDING", f"{rel_path} — waiting for iCloud confirmation", level="verbose")
+
+    def _preserve_remote_conflict_and_push(self, rel_path: str, local: str, cloud: str):
+        """Local vault is the editing authority; preserve remote before push."""
+        backup = conflict_backup_path(local)
+        shutil.copy2(cloud, backup)
+        backup_rel = os.path.normpath(os.path.relpath(backup, self.config.local_vault))
+        self._push_pending_confirmation(rel_path, local, cloud)
+        self.log.warn(
+            "CONFLICT",
+            f"{rel_path} — kept local, preserved remote as {backup_rel}",
+            level="important",
+        )
+        return "CONFLICT", {"conflict_path": backup_rel}
 
     async def sync_one(self, rel_path: str):
         config = self.config
@@ -354,6 +577,20 @@ class SyncEngine:
         cloud = os.path.join(config.cloud_vault, rel_path)
         baseline = os.path.join(config.sync_baseline, rel_path)
         local_exists, cloud_exists, baseline_exists = os.path.exists(local), os.path.exists(cloud), os.path.exists(baseline)
+
+        # Cloud Files can occasionally report directory placeholders as file
+        # events. Never let a directory reach hashing, copying, or deletion.
+        for path in (local, cloud, baseline):
+            if os.path.exists(path) and not os.path.isfile(path):
+                self.parked.discard(rel_path)
+                self._safety_blocks.discard(rel_path)
+                self.log.info("SKIP_DIR", rel_path, level="verbose")
+                return
+
+        if local_exists:
+            self._delete_candidates.pop((self._state_key(rel_path), "local"), None)
+        if cloud_exists:
+            self._delete_candidates.pop((self._state_key(rel_path), "cloud"), None)
 
         if cloud_exists:
             try:
@@ -383,26 +620,53 @@ class SyncEngine:
         else:
             self._hydration_succeeded(rel_path)
 
+        tombstone_event = self._handle_tombstone(rel_path, local, cloud, local_exists, cloud_exists)
+        if tombstone_event:
+            return tombstone_event
+
         if not local_exists and not cloud_exists:
             if baseline_exists:
-                os.remove(baseline)
+                # Baseline is the final recoverable copy. Never erase it merely
+                # because both watched paths disappeared in the same scan.
+                self._safety_blocks.add(rel_path)
+                self.log.error(
+                    "BASELINE_HELD",
+                    f"{rel_path} — both sides missing; preserved baseline for recovery",
+                    level="important",
+                )
+                return "BASELINE_HELD"
             return
 
+
+        if baseline_exists:
+            if local_exists and self._is_zero_regression(local, baseline):
+                self._block_zero_regression(rel_path, "local")
+                return "BLOCK_ZERO"
+            if cloud_exists and self._is_zero_regression(cloud, baseline):
+                self._block_zero_regression(rel_path, "cloud")
+                return "BLOCK_ZERO"
+        elif local_exists and cloud_exists:
+            # With no confirmed baseline, a zero/non-zero disagreement is too
+            # ambiguous to resolve automatically. Preserve both until review.
+            local_size, cloud_size = os.path.getsize(local), os.path.getsize(cloud)
+            if (local_size == 0) != (cloud_size == 0):
+                side = "local" if local_size == 0 else "cloud"
+                self._block_zero_regression(rel_path, side)
+                return "BLOCK_ZERO"
+        self._safety_blocks.discard(rel_path)
+
         if local_exists and not cloud_exists and not baseline_exists:
-            if not await self._settled(local, config.stability_window):
-                self._schedule_retry(rel_path, config.stability_window)
-                self.log.info("WAIT", f"{rel_path} not settled yet, deferring", level="verbose")
+            if not await self._content_settled(local, config.stability_window):
+                self._defer_unsettled(rel_path)
                 return
-            atomic_copy(local, cloud)
-            atomic_copy(local, baseline)
-            self._start_cooldown(rel_path, local)
-            self.log.success("PUSH", rel_path, level="verbose")
-            return "PUSH"
+            self._push_pending_confirmation(rel_path, local, cloud)
+            return "PUSH_PENDING"
 
         if cloud_exists and not local_exists and not baseline_exists:
-            if not await self._settled(cloud, config.stability_window):
-                self._schedule_retry(rel_path, config.stability_window)
-                self.log.info("WAIT", f"{rel_path} not settled yet, deferring", level="verbose")
+            if not await self._cloud_is_confirmed(rel_path, cloud):
+                return "CLOUD_WAIT"
+            if not await self._content_settled(cloud, config.stability_window):
+                self._defer_unsettled(rel_path)
                 return
             atomic_copy(cloud, local)
             atomic_copy(cloud, baseline)
@@ -411,11 +675,27 @@ class SyncEngine:
             return "PULL"
 
         if not local_exists and cloud_exists and baseline_exists:
-            if sha256_of(cloud) == sha256_of(baseline):
+            cloud_hash, baseline_hash = sha256_of(cloud), sha256_of(baseline)
+            if cloud_hash == baseline_hash:
+                if not await self._cloud_is_confirmed(rel_path, cloud):
+                    return "CLOUD_WAIT"
+                if not await self._content_settled(cloud, config.stability_window):
+                    self._defer_unsettled(rel_path)
+                    return
+                if not self._deletion_ready(rel_path, "local"):
+                    return "DELETE_WAIT"
+                if not self._allow_destructive_delete(rel_path):
+                    return "DELETE_FUSE"
+                self._record_tombstone(rel_path, "local", cloud_hash)
                 trash_move(config.cloud_vault, rel_path)
                 os.remove(baseline)
                 self.log.warn("DELETE", rel_path, level="verbose")
                 return "DELETE"
+            if not await self._cloud_is_confirmed(rel_path, cloud):
+                return "CLOUD_WAIT"
+            if not await self._content_settled(cloud, config.stability_window):
+                self._defer_unsettled(rel_path)
+                return
             atomic_copy(cloud, local)
             atomic_copy(cloud, baseline)
             self._start_cooldown(rel_path, cloud)
@@ -423,61 +703,92 @@ class SyncEngine:
             return "PULL"
 
         if not cloud_exists and local_exists and baseline_exists:
-            if sha256_of(local) == sha256_of(baseline):
+            local_hash, baseline_hash = sha256_of(local), sha256_of(baseline)
+            if local_hash == baseline_hash:
+                if not await self._content_settled(local, config.stability_window):
+                    self._defer_unsettled(rel_path)
+                    return
+                if not self._deletion_ready(rel_path, "cloud"):
+                    return "DELETE_WAIT"
+                if not self._allow_destructive_delete(rel_path):
+                    return "DELETE_FUSE"
+                self._record_tombstone(rel_path, "cloud", local_hash)
                 trash_move(config.local_vault, rel_path)
                 os.remove(baseline)
                 self.log.warn("DELETE", rel_path, level="verbose")
                 return "DELETE"
-            atomic_copy(local, cloud)
-            atomic_copy(local, baseline)
-            self._start_cooldown(rel_path, local)
-            self.log.success("PUSH", rel_path, level="verbose")
-            return "PUSH"
+            if not await self._content_settled(local, config.stability_window):
+                self._defer_unsettled(rel_path)
+                return
+            self._push_pending_confirmation(rel_path, local, cloud)
+            return "PUSH_PENDING"
 
         if local_exists and cloud_exists and not baseline_exists:
             # both sides already exist with no baseline yet (fresh vault, or
             # a file that predates oiiaw) — seed it quietly if they already
             # match, only treat it as a real conflict if they don't.
-            if sha256_of(local) == sha256_of(cloud):
+            if not await self._cloud_is_confirmed(rel_path, cloud):
+                return "CLOUD_WAIT"
+            local_hash, cloud_hash = sha256_of(local), sha256_of(cloud)
+            if local_hash == cloud_hash:
+                if not await self._content_settled(cloud, config.stability_window):
+                    self._defer_unsettled(rel_path)
+                    return
                 atomic_copy(local, baseline)
                 return
+            local_ok, cloud_ok = await asyncio.gather(
+                self._content_settled(local, config.stabilize_wait),
+                self._content_settled(cloud, config.stabilize_wait),
+            )
+            if not local_ok or not cloud_ok:
+                self._defer_unsettled(rel_path)
+                return
+            return self._preserve_remote_conflict_and_push(rel_path, local, cloud)
 
         local_hash, cloud_hash, baseline_hash = sha256_of(local), sha256_of(cloud), sha256_of(baseline)
         if local_hash == cloud_hash == baseline_hash:
             return
         if local_hash != baseline_hash and cloud_hash == baseline_hash:
-            atomic_copy(local, cloud)
-            atomic_copy(local, baseline)
-            self._start_cooldown(rel_path, local)
-            self.log.success("PUSH", rel_path, level="verbose")
-            return "PUSH"
+            if not await self._content_settled(local, config.stability_window):
+                self._defer_unsettled(rel_path)
+                return
+            # Re-read after the wait; the branch may have changed meanwhile.
+            if sha256_of(local) != local_hash or sha256_of(cloud) != cloud_hash:
+                self._defer_unsettled(rel_path)
+                return
+            self._push_pending_confirmation(rel_path, local, cloud)
+            return "PUSH_PENDING"
         elif cloud_hash != baseline_hash and local_hash == baseline_hash:
+            if not await self._cloud_is_confirmed(rel_path, cloud):
+                return "CLOUD_WAIT"
+            if not await self._content_settled(cloud, config.stability_window):
+                self._defer_unsettled(rel_path)
+                return
+            if sha256_of(cloud) != cloud_hash or sha256_of(local) != local_hash:
+                self._defer_unsettled(rel_path)
+                return
             atomic_copy(cloud, local)
             atomic_copy(cloud, baseline)
             self._start_cooldown(rel_path, cloud)
             self.log.success("PULL", rel_path, level="verbose")
             return "PULL"
         else:
-            # both sides changed — wait longer in case one is still mid-edit,
-            # then decide with fresh hashes instead of the ones we started with.
-            await asyncio.sleep(config.stabilize_wait)
+            if not await self._cloud_is_confirmed(rel_path, cloud):
+                return "CLOUD_WAIT"
+            local_ok, cloud_ok = await asyncio.gather(
+                self._content_settled(local, config.stabilize_wait),
+                self._content_settled(cloud, config.stabilize_wait),
+            )
+            if not local_ok or not cloud_ok:
+                self._defer_unsettled(rel_path)
+                return
             local_hash, cloud_hash = sha256_of(local), sha256_of(cloud)
-            if local_hash is not None and local_hash == cloud_hash:
+            if local_hash == cloud_hash:
                 atomic_copy(local, baseline)
                 self._start_cooldown(rel_path, local)
                 self.log.info("RESOLVED", f"{rel_path} — settled to the same content while waiting", level="verbose")
                 return "RESOLVED"
-            winner, loser = (local, cloud) if os.path.getmtime(local) >= os.path.getmtime(cloud) else (cloud, local)
-            loser_root = config.local_vault if loser == local else config.cloud_vault
-            backup = conflict_backup_path(loser)
-            backup_rel = os.path.normpath(os.path.relpath(backup, loser_root))
-            shutil.copy2(loser, backup)
-            atomic_copy(winner, local)
-            atomic_copy(winner, cloud)
-            atomic_copy(winner, baseline)
-            self._start_cooldown(rel_path, winner)
-            self.log.warn("CONFLICT", f"{rel_path} — kept newer, backed up loser", level="important")
-            return "CONFLICT", {"conflict_path": backup_rel}
+            return self._preserve_remote_conflict_and_push(rel_path, local, cloud)
 
     # ── main entry ──
 
@@ -494,7 +805,10 @@ class SyncEngine:
             while not self._shutdown_event.is_set():
                 if not os.path.isdir(self.config.cloud_vault):
                     raise FileNotFoundError(f"iCloud 폴더 연결이 끊김: {self.config.cloud_vault}")
-                state = "syncing" if self.active > 0 or not self.pending.empty() else "idle"
+                if self._delete_fuse_tripped or self._safety_blocks:
+                    state = "error"
+                else:
+                    state = "syncing" if self.active > 0 or not self.pending.empty() else "idle"
                 self.status.write(state, self.pending.qsize(), len(self.parked))
                 self.log.flush()
                 try:
