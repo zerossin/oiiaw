@@ -106,7 +106,8 @@ def cmd_status(args):
         uptime = int(time.time() - status["started_at"])
         print(
             f"daemon: running (pid {status['pid']}, uptime {uptime}s, "
-            f"state={status['state']}, pending={status['pending']}, parked={status.get('parked', 0)})"
+            f"state={status['state']}, pending_changes={status.get('pending', 0)}, "
+            f"scan_pending={status.get('scan_pending', 0)}, parked={status.get('parked', 0)})"
         )
         last = status.get("last_event")
         if last:

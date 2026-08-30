@@ -47,7 +47,7 @@ class StatusReporter:
         ):
             self.error_count += 1
 
-    def write(self, state: str, pending: int, parked: int = 0) -> bool:
+    def write(self, state: str, pending: int, parked: int = 0, scan_pending: int = 0) -> bool:
         if not self._path:
             return False
         data = {
@@ -56,6 +56,7 @@ class StatusReporter:
             "updated_at": time.time(),
             "state": state,
             "pending": pending,
+            "scan_pending": scan_pending,
             "parked": parked,
             "last_event": self.last_event,
             "history": list(self._history),

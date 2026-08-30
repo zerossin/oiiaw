@@ -13,6 +13,8 @@ from pathlib import Path
 TASK_NAME = "oiiaw"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "oiiaw"
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 
 def _locate_tray_exe() -> str | None:
@@ -127,5 +129,11 @@ def start_now() -> bool:
     exe = _locate_tray_exe()
     if not exe:
         return False
-    subprocess.Popen([exe])
-    return True
+    try:
+        kwargs = {"cwd": os.path.dirname(exe), "close_fds": True}
+        if os.name == "nt":
+            kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        subprocess.Popen([exe], **kwargs)
+        return True
+    except OSError:
+        return False

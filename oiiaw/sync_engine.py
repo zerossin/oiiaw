@@ -162,6 +162,10 @@ class SyncEngine:
         self.queued: set[str] = set()
         self.in_flight: set[str] = set()
         self.dirty: set[str] = set()
+        # Startup discovery queues every tracked path even when nothing has
+        # changed. Keep that inventory work separate from real filesystem
+        # events so the UI never reports thousands of "pending changes".
+        self.scan_pending: set[str] = set()
         self.parked: set[str] = set()
         self._hydrate_attempts: dict[str, int] = {}
         self._error_attempts: dict[str, int] = {}
@@ -326,7 +330,9 @@ class SyncEngine:
 
     # ── queue plumbing ──
 
-    def enqueue(self, rel_path: str, wake_parked: bool = False):
+    def enqueue(self, rel_path: str, wake_parked: bool = False, initial_scan: bool = False):
+        if initial_scan:
+            self.scan_pending.add(rel_path)
         if wake_parked:
             self.parked.discard(rel_path)
         elif rel_path in self.parked:
@@ -363,6 +369,27 @@ class SyncEngine:
         handle = self._retry_handles.pop(rel_path, None)
         if handle:
             handle.cancel()
+
+    def _queue_status_counts(self) -> tuple[int, int]:
+        """Return (real change queue, startup inventory queue)."""
+        scan_pending = len(self.scan_pending)
+        if scan_pending:
+            # Watchdog emits many metadata notifications while the startup
+            # inventory touches iCloud placeholders. Until that inventory is
+            # complete those events cannot be distinguished from real edits,
+            # so exposing them as "pending changes" recreates the misleading
+            # hundreds-of-edits counter this split is meant to prevent. Every
+            # path is still processed; only the UI count is deferred.
+            return 0, scan_pending
+        # Delayed confirmation/deletion retries are still unfinished changes.
+        # Counting only asyncio.Queue.qsize() creates a false idle window
+        # between retries and can let the auto-updater stop the daemon early.
+        change_paths = (
+            self.queued.difference(self.scan_pending)
+            | set(self._retry_handles)
+            | self.dirty
+        )
+        return len(change_paths), 0
 
     def _park_for_retry(self, rel_path: str) -> float:
         attempt = self._hydrate_attempts.get(rel_path, 0) + 1
@@ -436,6 +463,7 @@ class SyncEngine:
             finally:
                 self.active -= 1
                 self.in_flight.discard(rel_path)
+                self.scan_pending.discard(rel_path)
                 self.pending.task_done()
                 if rel_path in self.dirty:
                     self.dirty.discard(rel_path)
@@ -675,32 +703,27 @@ class SyncEngine:
             return "PULL"
 
         if not local_exists and cloud_exists and baseline_exists:
-            cloud_hash, baseline_hash = sha256_of(cloud), sha256_of(baseline)
-            if cloud_hash == baseline_hash:
-                if not await self._cloud_is_confirmed(rel_path, cloud):
-                    return "CLOUD_WAIT"
-                if not await self._content_settled(cloud, config.stability_window):
-                    self._defer_unsettled(rel_path)
-                    return
-                if not self._deletion_ready(rel_path, "local"):
-                    return "DELETE_WAIT"
-                if not self._allow_destructive_delete(rel_path):
-                    return "DELETE_FUSE"
-                self._record_tombstone(rel_path, "local", cloud_hash)
-                trash_move(config.cloud_vault, rel_path)
-                os.remove(baseline)
-                self.log.warn("DELETE", rel_path, level="verbose")
-                return "DELETE"
+            cloud_hash = sha256_of(cloud)
+            # The local vault is the editing authority. A cloud watcher event
+            # can arrive while this deletion is inside its grace period (most
+            # often after a just-written file is removed). Never turn that
+            # event into a PULL that resurrects the deleted local path. The
+            # current cloud bytes are moved to recoverable trash after the
+            # grace period even when they differ from the older baseline.
             if not await self._cloud_is_confirmed(rel_path, cloud):
                 return "CLOUD_WAIT"
             if not await self._content_settled(cloud, config.stability_window):
                 self._defer_unsettled(rel_path)
                 return
-            atomic_copy(cloud, local)
-            atomic_copy(cloud, baseline)
-            self._start_cooldown(rel_path, cloud)
-            self.log.success("PULL", rel_path, level="verbose")
-            return "PULL"
+            if not self._deletion_ready(rel_path, "local"):
+                return "DELETE_WAIT"
+            if not self._allow_destructive_delete(rel_path):
+                return "DELETE_FUSE"
+            self._record_tombstone(rel_path, "local", cloud_hash)
+            trash_move(config.cloud_vault, rel_path)
+            os.remove(baseline)
+            self.log.warn("DELETE", rel_path, level="verbose")
+            return "DELETE"
 
         if not cloud_exists and local_exists and baseline_exists:
             local_hash, baseline_hash = sha256_of(local), sha256_of(baseline)
@@ -801,15 +824,18 @@ class SyncEngine:
         workers = [asyncio.create_task(self._worker()) for _ in range(self.worker_count)]
         try:
             for rel in self.discover_tracked_paths():
-                self.enqueue(rel)
+                self.enqueue(rel, initial_scan=True)
             while not self._shutdown_event.is_set():
                 if not os.path.isdir(self.config.cloud_vault):
                     raise FileNotFoundError(f"iCloud 폴더 연결이 끊김: {self.config.cloud_vault}")
+                change_pending, scan_pending = self._queue_status_counts()
                 if self._delete_fuse_tripped or self._safety_blocks:
                     state = "error"
+                elif scan_pending:
+                    state = "scanning"
                 else:
-                    state = "syncing" if self.active > 0 or not self.pending.empty() else "idle"
-                self.status.write(state, self.pending.qsize(), len(self.parked))
+                    state = "syncing" if self.active > 0 or change_pending > 0 else "idle"
+                self.status.write(state, change_pending, len(self.parked), scan_pending=scan_pending)
                 self.log.flush()
                 try:
                     await asyncio.wait_for(self._shutdown_event.wait(), timeout=2)

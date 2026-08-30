@@ -56,6 +56,22 @@ def test_stale_heartbeat_uses_error_icon():
     assert app._tooltip(stale) == "oiiaw — 동기화 엔진 응답 없음"
 
 
+def test_scanning_state_has_a_tray_color_and_clear_tooltip():
+    app = TrayApp.__new__(TrayApp)
+    status = {
+        "updated_at": time.time(),
+        "last_event": None,
+        "state": "scanning",
+        "scan_pending": 600,
+        "pending": 0,
+        "parked": 0,
+        "conflict_count": 0,
+    }
+
+    assert app._icon_state(status) == "scanning"
+    assert "초기 검사 600개" in app._tooltip(status)
+
+
 def test_engine_is_rebuilt_after_unexpected_exit(monkeypatch):
     stop = threading.Event()
     errors = []

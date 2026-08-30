@@ -24,6 +24,7 @@ from .ui_assets import apply_window_icon, configure_windows_app_identity, tray_i
 
 _COLORS = {
     "idle": (70, 130, 180),
+    "scanning": (110, 145, 185),
     "syncing": (240, 170, 30),
     "conflict": (210, 60, 60),
     "error": (210, 60, 60),
@@ -66,7 +67,12 @@ class StatusWindow:
     status.json itself on a timer rather than being pushed to, matching
     how everything else here already works."""
 
-    _STATE_KR = {"idle": "대기 중", "syncing": "동기화 중", "error": "자동 복구 중"}
+    _STATE_KR = {
+        "idle": "대기 중",
+        "scanning": "시작 검사 중",
+        "syncing": "동기화 중",
+        "error": "자동 복구 중",
+    }
     _EVENT_KR = {
         "PUSH": "iCloud로 보냄",
         "PULL": "iCloud에서 받음",
@@ -212,7 +218,10 @@ class StatusWindow:
 
         state_kr = self._STATE_KR.get(status["state"], status["state"])
         uptime_min = int((time.time() - status["started_at"]) // 60)
-        summary = f"상태: {state_kr}  ·  대기 {status['pending']}개  ·  {uptime_min}분째 실행 중"
+        summary = f"상태: {state_kr}  ·  변경 대기 {status.get('pending', 0)}개"
+        if status.get("scan_pending"):
+            summary += f"  ·  초기 검사 {status['scan_pending']}개"
+        summary += f"  ·  {uptime_min}분째 실행 중"
         if status.get("parked"):
             summary += f"  ·  iCloud 다운로드 재시도 {status['parked']}개"
         if status.get("conflict_count"):
@@ -263,6 +272,10 @@ class TrayApp:
             return "oiiaw — 동기화 엔진 응답 없음"
         state_name = StatusWindow._STATE_KR.get(status["state"], status["state"])
         lines = [f"oiiaw — {state_name}"]
+        if status.get("scan_pending"):
+            lines.append(f"초기 검사 {status['scan_pending']}개")
+        elif status.get("pending"):
+            lines.append(f"변경 대기 {status['pending']}개")
         if status.get("parked"):
             lines.append(f"iCloud 다운로드 재시도 {status['parked']}개")
         last = status.get("last_event")
@@ -322,6 +335,7 @@ class TrayApp:
             StatusReporter.is_fresh(status)
             and status.get("state") == "idle"
             and status.get("pending", 0) == 0
+            and status.get("scan_pending", 0) == 0
         )
 
     def _begin_update(self, version: str) -> bool:

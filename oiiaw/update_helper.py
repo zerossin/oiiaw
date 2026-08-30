@@ -9,6 +9,9 @@ import time
 
 SYNCHRONIZE = 0x00100000
 WAIT_TIMEOUT = 258
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_NO_WINDOW = 0x08000000
 
 
 def wait_for_parent(pid: int, timeout_seconds: int = 120) -> bool:
@@ -72,12 +75,36 @@ def install_and_restart(version: str, parent_pid: int, tray_exe: str, log_path: 
             pass
 
     # On failure pip normally leaves or restores the previous installation.
-    # Relaunch either way so synchronization does not stay off silently.
+    # The parent's final heartbeat is still fresh here; remove it only after
+    # the parent has exited or the replacement process will reject itself as
+    # a duplicate and synchronization will stay off silently.
+    status_path = os.path.join(os.path.dirname(log_path), "status.json")
     try:
-        subprocess.Popen([tray_exe], cwd=os.path.dirname(tray_exe))
-    except OSError:
+        os.remove(status_path)
+    except FileNotFoundError:
         pass
-    return success
+    except OSError as exc:
+        try:
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] stale status cleanup failed: {exc}\n")
+        except OSError:
+            pass
+
+    # Relaunch either way so synchronization does not stay off silently.
+    restart_started = False
+    try:
+        kwargs = {"cwd": os.path.dirname(tray_exe), "close_fds": True}
+        if os.name == "nt":
+            kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        subprocess.Popen([tray_exe], **kwargs)
+        restart_started = True
+    except OSError as exc:
+        try:
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] restart failed: {exc}\n")
+        except OSError:
+            pass
+    return success and restart_started
 
 
 def main():

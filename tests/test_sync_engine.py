@@ -592,6 +592,64 @@ def test_deleted_file_resurrection_is_suppressed_by_tombstone(engine):
     assert not os.path.exists(cloud)
 
 
+def test_local_delete_during_unconfirmed_push_is_not_pulled_back(engine):
+    local = os.path.join(engine.config.local_vault, "note.md")
+    cloud = os.path.join(engine.config.cloud_vault, "note.md")
+    baseline = os.path.join(engine.config.sync_baseline, "note.md")
+    for path in (local, cloud, baseline):
+        with open(path, "w") as f:
+            f.write("old confirmed content")
+    with open(local, "w") as f:
+        f.write("new local content copied but not confirmed")
+
+    assert asyncio.run(engine.sync_one("note.md")) == "PUSH_PENDING"
+    assert open(cloud).read() == "new local content copied but not confirmed"
+    assert open(baseline).read() == "old confirmed content"
+
+    engine.config.delete_grace_seconds = 30
+    engine.cooldown._until.clear()
+    os.remove(local)
+
+    assert asyncio.run(engine.sync_one("note.md")) == "DELETE_WAIT"
+    assert not os.path.exists(local)
+    assert open(cloud).read() == "new local content copied but not confirmed"
+
+    key = (engine._state_key("note.md"), "local")
+    engine._delete_candidates[key] -= 31
+    assert asyncio.run(engine.sync_one("note.md")) == "DELETE"
+    assert not os.path.exists(local)
+    assert not os.path.exists(cloud)
+    assert not os.path.exists(baseline)
+    with open(os.path.join(engine.config.cloud_vault, ".trash", "note.md")) as f:
+        assert f.read() == "new local content copied but not confirmed"
+
+
+def test_startup_scan_queue_is_not_reported_as_pending_changes(engine):
+    engine.enqueue("unchanged-one.md", initial_scan=True)
+    engine.enqueue("unchanged-two.md", initial_scan=True)
+    engine.enqueue("real-watch-event.md")
+
+    change_pending, scan_pending = engine._queue_status_counts()
+
+    assert change_pending == 0
+    assert scan_pending == 2
+
+    engine.scan_pending.clear()
+    change_pending, scan_pending = engine._queue_status_counts()
+
+    assert change_pending == 3
+    assert scan_pending == 0
+
+
+def test_delayed_cloud_confirmation_is_still_a_pending_change(engine):
+    engine._retry_handles["confirming.md"] = object()
+
+    change_pending, scan_pending = engine._queue_status_counts()
+
+    assert change_pending == 1
+    assert scan_pending == 0
+
+
 def test_mass_delete_fuse_stops_additional_deletions(engine):
     engine.config.delete_batch_limit = 1
     for name in ("one.md", "two.md"):

@@ -112,6 +112,25 @@ def test_both_autostart_methods_report_failure(monkeypatch):
     assert "registry failed" in detail
 
 
+def test_start_now_uses_detached_process_and_reports_launch_failure(monkeypatch):
+    exe = r"C:\Python\Scripts\oiiaw-tray.exe"
+    launched = []
+    monkeypatch.setattr(autostart, "_locate_tray_exe", lambda: exe)
+    monkeypatch.setattr(autostart.subprocess, "Popen", lambda command, **kwargs: launched.append((command, kwargs)))
+
+    assert autostart.start_now() is True
+    assert launched[0][0] == [exe]
+    assert launched[0][1]["cwd"] == r"C:\Python\Scripts"
+    assert launched[0][1]["close_fds"] is True
+
+    monkeypatch.setattr(
+        autostart.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cannot launch")),
+    )
+    assert autostart.start_now() is False
+
+
 def test_unregister_removes_task_and_registry(monkeypatch):
     calls = []
 
