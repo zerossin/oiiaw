@@ -36,6 +36,7 @@ def build_config(local_vault: str, cloud_vault: str) -> dict:
             "cloud_vault": cloud_vault,
             "sync_baseline": os.path.join(data_dir, "baselines", vault_id),
             "logs_dir": os.path.join(data_dir, "logs"),
+            "conflict_recovery_dir": os.path.join(data_dir, "recovery", vault_id),
         },
         "ignore": {
             "dirs": [".trash", ".fseventsd", ".spotlight-v100", ".apdisk"],

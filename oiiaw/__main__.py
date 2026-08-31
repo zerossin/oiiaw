@@ -112,7 +112,10 @@ def cmd_status(args):
         last = status.get("last_event")
         if last:
             print(f"  last event: {last['type']} {last['path']} ({int(time.time() - last['time'])}s ago)")
-        print(f"  this session: {status['conflict_count']} conflicts, {status['error_count']} errors")
+        print(
+            f"  this session: {status['conflict_count']} conflicts, {status['error_count']} errors; "
+            f"open conflict reviews: {status.get('unresolved_conflict_count', 0)}"
+        )
     else:
         print("daemon: not running (or not responding)")
 

@@ -24,6 +24,7 @@ def make_config(tmp_path):
         cloud_vault=str(tmp_path / "cloud"),
         sync_baseline=str(tmp_path / "baseline"),
         logs_dir=str(tmp_path / "logs"),
+        conflict_recovery_dir=str(tmp_path / "recovery"),
         ignored_dirs=set(),
         ignored_files=set(),
         ignore_patterns=[],
@@ -38,6 +39,8 @@ def make_config(tmp_path):
         delete_batch_limit=20,
         delete_batch_window=60,
         protect_nonempty_from_zero=True,
+        local_generation_ttl=86400,
+        local_generation_limit=16,
         cooldown_seconds=0.01,
         big_file_threshold=102400,
         big_file_cooldown=0.01,
@@ -97,13 +100,12 @@ def test_genuinely_different_files_with_no_baseline_are_a_real_conflict(engine):
 
     event = asyncio.run(engine.sync_one("note.md"))
 
-    # the loser (older mtime) can end up on either side depending on write
-    # timing, so check both instead of assuming which one lost.
-    all_files = os.listdir(engine.config.local_vault) + os.listdir(engine.config.cloud_vault)
-    assert any("_CONFLICT_" in f for f in all_files)
     assert event[0] == "CONFLICT"
     assert event[1]["conflict_path"].endswith(".md")
     assert ".md_CONFLICT_" not in event[1]["conflict_path"]
+    assert os.path.isfile(event[1]["conflict_path"])
+    assert os.path.commonpath((event[1]["conflict_path"], engine.recovery_root)) == engine.recovery_root
+    assert os.listdir(engine.config.local_vault) == ["note.md"]
 
 
 def test_conflict_backup_path_keeps_extension_and_avoids_collision(tmp_path, monkeypatch):
@@ -552,6 +554,92 @@ def test_push_keeps_old_baseline_until_cloud_matches_and_is_confirmed(engine, mo
     third = asyncio.run(engine.sync_one("note.md"))
     assert third == "RESOLVED"
     assert open(baseline).read() == "new local version that must survive"
+
+
+def test_previous_local_autosave_generation_is_not_a_conflict(engine):
+    local = os.path.join(engine.config.local_vault, "note.md")
+    cloud = os.path.join(engine.config.cloud_vault, "note.md")
+    baseline = os.path.join(engine.config.sync_baseline, "note.md")
+    for path in (local, cloud, baseline):
+        with open(path, "w") as f:
+            f.write("A: confirmed")
+
+    with open(local, "w") as f:
+        f.write("B: first Obsidian autosave")
+    assert asyncio.run(engine.sync_one("note.md")) == "PUSH_PENDING"
+
+    # Obsidian advances to C while iCloud still exposes B. Both now differ
+    # from baseline A, which used to manufacture a false conflict.
+    with open(local, "w") as f:
+        f.write("C: next Obsidian autosave")
+    engine.cooldown._until.clear()
+
+    assert asyncio.run(engine.sync_one("note.md")) == "REPLAY_SUPPRESSED"
+    assert open(cloud).read() == "C: next Obsidian autosave"
+    assert open(baseline).read() == "A: confirmed"
+    assert not os.path.exists(engine.config.conflict_recovery_dir)
+
+
+def test_local_generation_history_survives_restart(engine, monkeypatch):
+    local = os.path.join(engine.config.local_vault, "note.md")
+    cloud = os.path.join(engine.config.cloud_vault, "note.md")
+    baseline = os.path.join(engine.config.sync_baseline, "note.md")
+    for path in (local, cloud, baseline):
+        with open(path, "w") as f:
+            f.write("A: confirmed")
+
+    with open(local, "w") as f:
+        f.write("B: pushed immediately before restart")
+    assert asyncio.run(engine.sync_one("note.md")) == "PUSH_PENDING"
+    with open(local, "w") as f:
+        f.write("C: saved after restart")
+
+    restarted = SyncEngine(engine.config, NullLogger())
+
+    async def available(path):
+        return True
+
+    async def confirmed(path):
+        return True
+
+    monkeypatch.setattr(restarted.cloud, "is_content_available", available)
+    monkeypatch.setattr(restarted.cloud, "is_content_in_sync", confirmed)
+
+    assert asyncio.run(restarted.sync_one("note.md")) == "REPLAY_SUPPRESSED"
+    assert open(cloud).read() == "C: saved after restart"
+    assert not os.path.exists(engine.config.conflict_recovery_dir)
+
+
+def test_known_local_generation_replayed_after_confirmation_is_not_pulled(engine):
+    local = os.path.join(engine.config.local_vault, "note.md")
+    cloud = os.path.join(engine.config.cloud_vault, "note.md")
+    baseline = os.path.join(engine.config.sync_baseline, "note.md")
+    for path in (local, cloud, baseline):
+        with open(path, "w") as f:
+            f.write("A: confirmed")
+
+    with open(local, "w") as f:
+        f.write("B: earlier local generation")
+    assert asyncio.run(engine.sync_one("note.md")) == "PUSH_PENDING"
+    engine.cooldown._until.clear()
+    assert asyncio.run(engine.sync_one("note.md")) == "RESOLVED"
+
+    with open(local, "w") as f:
+        f.write("C: latest confirmed local generation")
+    engine.cooldown._until.clear()
+    assert asyncio.run(engine.sync_one("note.md")) == "PUSH_PENDING"
+    engine.cooldown._until.clear()
+    assert asyncio.run(engine.sync_one("note.md")) == "RESOLVED"
+
+    # The provider replays B after C was already confirmed. The old pull
+    # branch would roll the local document back from C to B.
+    with open(cloud, "w") as f:
+        f.write("B: earlier local generation")
+    engine.cooldown._until.clear()
+
+    assert asyncio.run(engine.sync_one("note.md")) == "REPLAY_SUPPRESSED"
+    assert open(local).read() == "C: latest confirmed local generation"
+    assert open(cloud).read() == "C: latest confirmed local generation"
 
 
 def test_transient_zero_cloud_after_push_is_blocked_not_pulled(engine):

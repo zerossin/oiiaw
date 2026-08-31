@@ -22,20 +22,35 @@ _REPLACE_RETRY_DELAY = 0.05
 
 
 class StatusReporter:
-    def __init__(self, logs_dir: str | None):
+    def __init__(self, logs_dir: str | None, recovery_root: str | None = None):
         self._path = os.path.join(logs_dir, "status.json") if logs_dir else None
+        self._recovery_root = recovery_root
         self.pid = os.getpid()
         self.started_at = time.time()
         self.conflict_count = 0
+        self._unresolved_conflicts: dict[str, str] = {}
         self.error_count = 0
         self.last_event: dict | None = None
         self._history: deque = deque(maxlen=HISTORY_LIMIT)
+
+    def _open_conflict_paths(self) -> set[str]:
+        paths = {
+            path for path in self._unresolved_conflicts
+            if not os.path.isabs(path) or os.path.isfile(path)
+        }
+        if self._recovery_root and os.path.isdir(self._recovery_root):
+            for current, _, files in os.walk(self._recovery_root):
+                paths.update(os.path.join(current, name) for name in files)
+        return paths
 
     def record_event(self, event_type: str, rel_path: str, **details):
         self.last_event = {"type": event_type, "path": rel_path, "time": time.time(), **details}
         self._history.append(self.last_event)
         if event_type == "CONFLICT":
             self.conflict_count += 1
+            conflict_path = details.get("conflict_path")
+            if conflict_path:
+                self._unresolved_conflicts[conflict_path] = rel_path
         elif event_type in (
             "ERROR",
             "PROBE_TIMEOUT",
@@ -50,6 +65,13 @@ class StatusReporter:
     def write(self, state: str, pending: int, parked: int = 0, scan_pending: int = 0) -> bool:
         if not self._path:
             return False
+        # New recovery paths are absolute and live outside the watched vaults.
+        # Once the user removes a reviewed copy, it no longer counts as open.
+        open_conflicts = self._open_conflict_paths()
+        self._unresolved_conflicts = {
+            path: rel_path for path, rel_path in self._unresolved_conflicts.items()
+            if path in open_conflicts
+        }
         data = {
             "pid": self.pid,
             "started_at": self.started_at,
@@ -61,6 +83,7 @@ class StatusReporter:
             "last_event": self.last_event,
             "history": list(self._history),
             "conflict_count": self.conflict_count,
+            "unresolved_conflict_count": len(open_conflicts),
             "error_count": self.error_count,
         }
         tmp = self._path + ".tmp"

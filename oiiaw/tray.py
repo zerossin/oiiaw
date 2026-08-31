@@ -54,7 +54,11 @@ def conflict_event_paths(config, event: dict | None) -> tuple[str | None, str | 
         return None, None
     current = os.path.join(config.local_vault, event.get("path", ""))
     conflict_rel = event.get("conflict_path")
-    conflict = os.path.join(config.local_vault, conflict_rel) if conflict_rel else None
+    conflict = (
+        conflict_rel if conflict_rel and os.path.isabs(conflict_rel)
+        else os.path.join(config.local_vault, conflict_rel) if conflict_rel
+        else None
+    )
     return current, conflict
 
 
@@ -85,6 +89,7 @@ class StatusWindow:
         "PUSH_PENDING": "iCloud 확인 대기",
         "CLOUD_WAIT": "iCloud 확정 대기",
         "CONFLICT": "충돌본 보관",
+        "REPLAY_SUPPRESSED": "이전 저장본 재등장 차단",
         "RESOLVED": "충돌 자동 해소",
         "RECOVERED": "자동 복구 완료",
         "PARK": "iCloud 다운로드 대기",
@@ -224,8 +229,8 @@ class StatusWindow:
         summary += f"  ·  {uptime_min}분째 실행 중"
         if status.get("parked"):
             summary += f"  ·  iCloud 다운로드 재시도 {status['parked']}개"
-        if status.get("conflict_count"):
-            summary += f"  ·  충돌 {status['conflict_count']}건"
+        if status.get("unresolved_conflict_count"):
+            summary += f"  ·  충돌 검토 필요 {status['unresolved_conflict_count']}건"
         self.state_label.config(text=summary, fg="#000000")
         self.paths_label.config(text=f"로컬: {self.config.local_vault}\niCloud: {self.config.cloud_vault}")
 
@@ -282,8 +287,8 @@ class TrayApp:
         if last:
             event_name = StatusWindow._EVENT_KR.get(last["type"], last["type"])
             lines.append(f"최근: {event_name} {last['path']}")
-        if status.get("conflict_count"):
-            lines.append(f"충돌 {status['conflict_count']}건 (이번 세션)")
+        if status.get("unresolved_conflict_count"):
+            lines.append(f"충돌 검토 필요 {status['unresolved_conflict_count']}건")
         return "\n".join(lines)
 
     def _icon_state(self, status: dict | None) -> str:

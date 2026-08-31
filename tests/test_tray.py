@@ -132,6 +132,18 @@ def test_conflict_event_resolves_local_current_and_backup_paths(tmp_path):
     assert conflict == os.path.join(str(tmp_path), "notes/note_CONFLICT_1.md")
 
 
+def test_conflict_event_accepts_external_recovery_path(tmp_path):
+    config = types.SimpleNamespace(local_vault=str(tmp_path / "vault"))
+    recovery = os.path.abspath(tmp_path / "recovery" / "note_CONFLICT_1.md")
+    current, conflict = conflict_event_paths(
+        config,
+        {"type": "CONFLICT", "path": "notes/note.md", "conflict_path": recovery},
+    )
+
+    assert current == os.path.join(config.local_vault, "notes/note.md")
+    assert conflict == recovery
+
+
 def test_update_handoff_stops_tray_without_normal_relaunch(tmp_path, monkeypatch):
     calls = []
 

@@ -6,6 +6,7 @@ paths:
   cloud_vault: ""
   sync_baseline: "C:\\Obsidian\\Baseline"
   logs_dir: "C:\\Obsidian\\Logs"
+  conflict_recovery_dir: "C:\\Obsidian\\oiiaw-recovery"  # must be outside both watched vaults
 
 sync:
   stability_window: 3
@@ -22,6 +23,8 @@ sync:
   delete_batch_limit: 20
   delete_batch_window: 60
   protect_nonempty_from_zero: true
+  local_generation_ttl: 86400  # remember locally-originated versions for one day
+  local_generation_limit: 16  # bounded history per path
   big_file_threshold: 102400
   big_file_cooldown: 30
 

@@ -37,6 +37,39 @@ def test_event_details_are_written_for_conflict_actions(tmp_path):
     assert status["last_event"]["conflict_path"] == "note_CONFLICT_1.md"
 
 
+def test_open_conflicts_are_separate_from_session_history(tmp_path):
+    recovery = tmp_path / "recovery" / "note_CONFLICT_1.md"
+    recovery.parent.mkdir()
+    recovery.write_text("preserved remote bytes")
+    reporter = StatusReporter(str(tmp_path))
+    reporter.record_event("CONFLICT", "note.md", conflict_path=str(recovery))
+    reporter.write("idle", pending=0)
+
+    status = StatusReporter.read(str(tmp_path))
+    assert status["conflict_count"] == 1
+    assert status["unresolved_conflict_count"] == 1
+
+    recovery.unlink()
+    reporter.write("idle", pending=0)
+    status = StatusReporter.read(str(tmp_path))
+    assert status["conflict_count"] == 1
+    assert status["unresolved_conflict_count"] == 0
+
+
+def test_recovery_store_is_recounted_after_restart(tmp_path):
+    recovery_root = tmp_path / "recovery"
+    recovery = recovery_root / "notes" / "note_CONFLICT_1.md"
+    recovery.parent.mkdir(parents=True)
+    recovery.write_text("preserved remote bytes")
+
+    restarted = StatusReporter(str(tmp_path), str(recovery_root))
+    restarted.write("idle", pending=0)
+    status = StatusReporter.read(str(tmp_path))
+
+    assert status["conflict_count"] == 0
+    assert status["unresolved_conflict_count"] == 1
+
+
 def test_write_retries_when_windows_temporarily_blocks_replace(tmp_path, monkeypatch):
     reporter = StatusReporter(str(tmp_path))
     real_replace = os.replace

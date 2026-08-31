@@ -1,7 +1,10 @@
 import os
 import glob
+import hashlib
 import yaml
 from dataclasses import dataclass
+
+from .paths import app_data_dir
 
 
 def discover_icloud_vault() -> str | None:
@@ -35,6 +38,15 @@ class Config:
         self.cloud_vault = paths.get("cloud_vault") or discover_icloud_vault() or ""
         self.sync_baseline = paths.get("sync_baseline", "")
         self.logs_dir = paths.get("logs_dir", "")
+        vault_identity = "\0".join(
+            os.path.normcase(os.path.abspath(path))
+            for path in (self.local_vault, self.cloud_vault)
+        )
+        vault_id = hashlib.sha256(vault_identity.encode("utf-8")).hexdigest()[:16]
+        self.conflict_recovery_dir = (
+            paths.get("conflict_recovery_dir")
+            or os.path.join(app_data_dir(), "recovery", vault_id)
+        )
 
         sync = data.get("sync", {})
         self.stability_window = sync.get("stability_window", 3)
@@ -51,6 +63,8 @@ class Config:
         self.delete_batch_limit = sync.get("delete_batch_limit", 20)
         self.delete_batch_window = sync.get("delete_batch_window", 60)
         self.protect_nonempty_from_zero = sync.get("protect_nonempty_from_zero", True)
+        self.local_generation_ttl = sync.get("local_generation_ttl", 86400)
+        self.local_generation_limit = sync.get("local_generation_limit", 16)
         self.big_file_threshold = sync.get("big_file_threshold", 102400)
         self.big_file_cooldown = sync.get("big_file_cooldown", 30)
         logging_cfg = data.get("logging", {})
@@ -80,6 +94,12 @@ class Config:
             problems.append(ConfigProblem("paths.cloud_vault is not set and could not be auto-discovered", blocking=True))
         if self.local_vault and self.cloud_vault and paths_overlap(self.local_vault, self.cloud_vault):
             problems.append(ConfigProblem("local_vault and cloud_vault must not contain each other", blocking=True))
+        for name, vault in (("local_vault", self.local_vault), ("cloud_vault", self.cloud_vault)):
+            if vault and paths_overlap(vault, self.conflict_recovery_dir):
+                problems.append(ConfigProblem(
+                    f"conflict_recovery_dir must be outside {name}",
+                    blocking=True,
+                ))
         if self.local_vault and not os.path.isdir(self.local_vault):
             problems.append(ConfigProblem(f"local_vault does not exist yet: {self.local_vault}", blocking=False))
         if self.cloud_vault and not os.path.isdir(self.cloud_vault):
